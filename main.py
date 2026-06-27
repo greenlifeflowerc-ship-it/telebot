@@ -3,17 +3,16 @@ Telegram video / audio downloader bot — webhook architecture for Render Web Se
 
 The user sends a public video URL (YouTube / TikTok / Instagram) and the bot
 replies with two inline buttons:
-    1. تحميل فيديو      -> show ONLY the qualities that actually exist for the link
+    1. تحميل فيديو      -> show the available qualities (incl. "الجودة الأصلية")
     2. تحميل صوت MP3     -> extract the audio and convert it to MP3
 
-Speed first:
-- Available qualities are read from the link's real yt-dlp formats; only those
-  buttons are shown. Per chat we store just a small {callback -> selector} map.
-- After download the file is inspected with ffprobe. A compatible MP4 is sent
-  directly (or fast-remuxed, never re-encoded). Heavy re-encoding is avoided by
-  default (NO_REENCODE_BY_DEFAULT); incompatible videos ask the user for a
-  lower quality instead.
-- The video is sent ONCE with sendVideo (never also as a document).
+No compression by design:
+- Video is downloaded in the best available ORIGINAL quality and only the
+  container is fixed to MP4 with a fast **stream copy** (`ffmpeg -c copy`).
+- The bot NEVER re-encodes video (no libx264 / CRF / scale) when
+  NO_VIDEO_COMPRESSION=true (the default). Remux is far faster than compression
+  and keeps the original resolution/quality untouched.
+- If the original file is over Telegram's bot limit it is rejected (not shrunk).
 
 This app is built for WEBHOOK deployment (NOT long polling), so it runs cleanly
 as a Render Web Service behind FastAPI + Uvicorn. The webhook handler returns to
@@ -22,7 +21,6 @@ Telegram immediately and does the slow work in a background task.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -68,19 +66,20 @@ WEBHOOK_SECRET: str = os.environ.get("WEBHOOK_SECRET", "").strip()
 # Debug-only /webhook-info endpoint.
 DEBUG: bool = _flag("DEBUG")
 
-# Low-memory mode for small instances (e.g. Render Free, 512 MB). Hides 1080p,
-# caps re-encode height at 720p, serializes media jobs.
-LOW_RESOURCE_MODE: bool = _flag("LOW_RESOURCE_MODE")
+# Master switch: never compress/re-encode video — download + stream-copy remux
+# only. ON by default; this is the whole point of the bot's speed.
+NO_VIDEO_COMPRESSION: bool = _flag("NO_VIDEO_COMPRESSION", default=True)
 
-# Fast mode: send a compatible MP4 directly (no ffmpeg) instead of remuxing.
-FAST_MODE: bool = _flag("FAST_MODE")
-
-# Never re-encode by default (the slow path). When True, incompatible videos are
-# refused with a "try a lower quality" message instead of being re-encoded.
+# Never re-encode by default (kept for the gated, opt-in fallback below).
 NO_REENCODE_BY_DEFAULT: bool = _flag("NO_REENCODE_BY_DEFAULT", default=True)
 
-# Optionally ALSO send the video as a document copy. Off by default — the bot
-# sends the video only once via sendVideo.
+# Fast mode: send a compatible MP4 directly (no ffmpeg) instead of remuxing it.
+FAST_MODE: bool = _flag("FAST_MODE")
+
+# Low-memory mode — only affects the (rare, opt-in) re-encode fallback height cap.
+LOW_RESOURCE_MODE: bool = _flag("LOW_RESOURCE_MODE")
+
+# Optionally ALSO send the video as a document copy. Off by default.
 SEND_VIDEO_AS_FILE_COPY: bool = _flag("SEND_VIDEO_AS_FILE_COPY")
 
 # Telegram Bot API practical upload limit for bots is 50 MB; stay just under it.
@@ -105,11 +104,23 @@ _SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 # First http(s) link inside a text message.
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
-# Standard heights we offer as buttons (high -> low), plus Small.
+# Standard heights we offer as buttons (high -> low), plus Original and Small.
 STANDARD_HEIGHTS = (1080, 720, 480, 360, 240)
+
+# Best available ORIGINAL quality — prefer mp4 / H.264 (avc1) + m4a/AAC so the
+# raw file is already compatible and only needs a container remux.
+ORIGINAL_SELECTOR = (
+    "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+    "best[ext=mp4][vcodec^=avc1]/"
+    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+    "best[ext=mp4]/"
+    "bestvideo+bestaudio/best"
+)
+SMALL_SELECTOR = "worst[ext=mp4]/worst"
 
 # callback_data -> button label. callback_data is kept short on purpose.
 CALLBACK_LABELS: Dict[str, str] = {
+    "v_original": "الجودة الأصلية",
     "v_1080": "1080p",
     "v_720": "720p",
     "v_480": "480p",
@@ -118,7 +129,6 @@ CALLBACK_LABELS: Dict[str, str] = {
     "v_small": "أقل حجم / Small",
 }
 VIDEO_QUALITY_KEYS = tuple(CALLBACK_LABELS.keys())
-SMALL_SELECTOR = "worst[ext=mp4]/worst"
 
 # Prefix for every per-job temp folder; matched by the startup stale-folder sweep.
 TEMP_PREFIX = "tg_downloader_"
@@ -126,13 +136,12 @@ TEMP_PREFIX = "tg_downloader_"
 # Per-chat memory (in-memory only; cleared on restart):
 #   last_url_by_chat       -> the last URL the user sent
 #   last_selectors_by_chat -> SMALL map {callback -> yt-dlp format selector}
-# We deliberately never store the (large) yt-dlp info object.
 last_url_by_chat: Dict[int, str] = {}
 last_selectors_by_chat: Dict[int, Dict[str, str]] = {}
 
 # Concurrency state (guarded by _downloads_lock; downloads run in a threadpool):
 #   active_downloads   -> one active download per chat_id
-#   _global_job_active -> at most ONE media job server-wide (low-memory safety)
+#   _global_job_active -> at most ONE media job server-wide
 active_downloads: set[int] = set()
 _global_job_active: bool = False
 _downloads_lock = threading.Lock()
@@ -168,32 +177,27 @@ MSG_BUSY = "يوجد تحميل قيد التنفيذ حالياً، انتظر 
 MSG_SERVER_BUSY = "السيرفر يعالج طلباً آخر حالياً، حاول بعد قليل."
 MSG_VIDEO_QUALITY_MENU = (
     "اختر دقة الفيديو المتاحة:\n"
-    "(الأسرع هو اختيار 480p أو 360p بدون ضغط)"
+    "(الأسرع هو اختيار 480p أو 360p — بدون ضغط)"
 )
-MSG_720_SLOW = "قد يستغرق تحميل 720p وقتاً أطول على الخطة المجانية."
 MSG_NO_VIDEO = "لا يوجد فيديو متاح لهذا الرابط. جرّب رابطًا آخر أو تحميل الصوت MP3."
 MSG_FORMATS_UNREADABLE = "لم أستطع قراءة الدقات المتاحة، سأعرض خيارات آمنة للتجربة."
-MSG_PREPARING = "جاري تجهيز الفيديو..."
+MSG_NOT_DIRECT = "هذه الدقة غير متاحة مباشرة من المصدر."
+MSG_DOWNLOADING_ORIGINAL = "جاري تحميل الفيديو بالدقة الأصلية..."
+MSG_REMUXING = "جاري تحويل الصيغة بسرعة بدون ضغط..."
 MSG_SENDING_VIDEO = "جاري إرسال الفيديو..."
-MSG_COMPRESSING = "جاري ضغط الفيديو ليتوافق مع تلغرام..."
-MSG_NEEDS_CONVERSION = (
-    "هذا الفيديو يحتاج تحويل وقد يستغرق وقتاً طويلاً على الخطة المجانية. جرّب دقة أقل."
+MSG_COMPRESSING = "جاري ضغط الفيديو ليتوافق مع تلغرام..."  # only in the opt-in fallback
+MSG_REMUX_FAILED = (
+    "تعذر تحويل صيغة الفيديو بدون ضغط. هذا الرابط يحتاج معالجة ثقيلة. "
+    "جرّب رابط آخر أو دقة أقل إذا كانت متاحة."
 )
-MSG_QUALITY_UNAVAILABLE = "هذه الدقة غير متاحة لهذا الرابط. جرّب دقة أخرى."
-MSG_1080_BLOCKED_LOWRES = (
-    "دقة 1080p غير متاحة على الخطة المجانية بسبب محدودية الرام. "
-    "جرّب 720p أو 480p."
-)
-MSG_VIDEO_DONE = "تم تحميل الفيديو."
-MSG_VIDEO_PROCESS_FAILED = (
-    "تعذّرت معالجة الفيديو لجعله متوافقًا مع تيليجرام. جرّب دقة أخرى أو رابطًا آخر."
+MSG_VIDEO_DONE_ORIGINAL = "تم تحميل الفيديو بالدقة الأصلية."
+MSG_TOO_LARGE_ORIGINAL = (
+    "الفيديو بالدقة الأصلية أكبر من حد تلغرام للبوت. "
+    "جرّب رابط أقصر أو دقة أقل إذا كانت متاحة."
 )
 MSG_TOO_LARGE = (
     "⚠️ حجم الملف أكبر من الحد المسموح به في تيليجرام (حوالي 50 ميجابايت)، "
     "لذلك لا يمكن إرساله.\nجرّب فيديو أقصر أو جودة أقل."
-)
-MSG_TOO_LARGE_VIDEO = (
-    "الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 480p أو 360p."
 )
 MSG_AUDIO_NO_MP3 = "تم تحميل الصوت، لكن لم أستطع تحويله إلى MP3."
 MSG_AUDIO_FAILED = "فشل تحميل الصوت. جرّب رابط آخر أو تأكد أن الرابط عام."
@@ -208,11 +212,7 @@ MSG_ERROR = (
 # --------------------------------------------------------------------------- #
 
 def _api(method: str, *, timeout: int = 30, **kwargs: Any) -> Optional[dict]:
-    """Call a Telegram Bot API method.
-
-    Returns the parsed JSON response, or None on a transport error. The bot
-    token is part of TELEGRAM_API and is deliberately never logged.
-    """
+    """Call a Telegram Bot API method. The bot token is never logged."""
     try:
         resp = requests.post(f"{TELEGRAM_API}/{method}", timeout=timeout, **kwargs)
         data = resp.json()
@@ -294,8 +294,8 @@ def send_audio(chat_id: int, path: str, caption: Optional[str] = None) -> bool:
 def public_base_url() -> str:
     """Public HTTPS base URL of this service, resolved in priority order:
 
-    1. PUBLIC_URL                      -> used as-is (override / non-Render / tunnels)
-    2. RENDER_EXTERNAL_URL             -> used as-is (full URL, if Render provides it)
+    1. PUBLIC_URL                      -> used as-is
+    2. RENDER_EXTERNAL_URL             -> used as-is
     3. https://{RENDER_EXTERNAL_HOSTNAME}  -> built from Render's default host var
     """
     public_url = os.environ.get("PUBLIC_URL", "").strip()
@@ -403,10 +403,14 @@ def download_keyboard() -> dict:
 
 
 def quality_keyboard(callback_keys: List[str]) -> dict:
-    """Build the quality inline keyboard (two buttons per row) from callback keys."""
+    """Build the quality keyboard: "الجودة الأصلية" full-width on top, rest 2/row."""
     rows: List[List[dict]] = []
+    keys = list(callback_keys)
+    if "v_original" in keys:
+        rows.append([{"text": CALLBACK_LABELS["v_original"], "callback_data": "v_original"}])
+        keys = [k for k in keys if k != "v_original"]
     row: List[dict] = []
-    for key in callback_keys:
+    for key in keys:
         row.append({"text": CALLBACK_LABELS.get(key, key), "callback_data": key})
         if len(row) == 2:
             rows.append(row)
@@ -421,8 +425,9 @@ def quality_keyboard(callback_keys: List[str]) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _selector_for_height(height: int) -> str:
-    """yt-dlp selector for a height: prefer progressive mp4/H.264, then mp4
-    video + m4a audio, then any mp4, then any format <= height."""
+    """yt-dlp selector for a height: pick the closest REAL source format (no
+    scaling): progressive mp4/H.264, then mp4 video + m4a audio, then any mp4,
+    then any format <= height."""
     return (
         f"best[height<={height}][ext=mp4][vcodec^=avc1]/"
         f"bestvideo[height<={height}][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
@@ -431,25 +436,25 @@ def _selector_for_height(height: int) -> str:
     )
 
 
-def _selector_from_callback(callback: str) -> str:
-    """Fallback selector when no stored map exists (e.g. after a restart)."""
-    if callback == "v_small":
-        return SMALL_SELECTOR
-    return _selector_for_height(_height_from_key(callback))
-
-
 def _height_from_key(callback: str) -> int:
-    if callback == "v_small":
-        return 360
     try:
         return int(callback.split("_")[1])
     except (IndexError, ValueError):
         return 720
 
 
+def _selector_from_callback(callback: str) -> str:
+    """Fallback selector when no stored map exists (e.g. after a restart)."""
+    if callback == "v_original":
+        return ORIGINAL_SELECTOR
+    if callback == "v_small":
+        return SMALL_SELECTOR
+    return _selector_for_height(_height_from_key(callback))
+
+
 def _fallback_selectors() -> Dict[str, str]:
     """Safe options when the link's formats can't be read."""
-    options: Dict[str, str] = {}
+    options: Dict[str, str] = {"v_original": ORIGINAL_SELECTOR}
     for height in (720, 480, 360):
         options[f"v_{height}"] = _selector_for_height(height)
     options["v_small"] = SMALL_SELECTOR
@@ -457,10 +462,10 @@ def _fallback_selectors() -> Dict[str, str]:
 
 
 def analyze_video_qualities(url: str) -> Optional[Dict[str, str]]:
-    """Inspect the link (download=False) and return ONLY the qualities that
-    actually exist as a small {callback -> selector} map.
+    """Inspect the link (download=False) and return a small {callback -> selector}
+    map: "الجودة الأصلية" plus ONLY the standard resolutions that actually exist.
 
-    Returns None if formats can't be read at all, or {} if there is no video.
+    Returns None if formats can't be read, or {} if there is no video.
     The large yt-dlp info object is never stored.
     """
     opts = {
@@ -492,17 +497,13 @@ def analyze_video_qualities(url: str) -> Optional[Dict[str, str]]:
     if not has_video:
         return {}
 
-    options: Dict[str, str] = {}
+    # Original first, then any standard resolution the source genuinely has.
+    options: Dict[str, str] = {"v_original": ORIGINAL_SELECTOR}
     if heights:
         min_h, max_h = min(heights), max(heights)
         for bucket in STANDARD_HEIGHTS:
-            if LOW_RESOURCE_MODE and bucket == 1080:
-                continue  # 1080p hidden on low-memory instances
-            # A bucket is "available" only when the source genuinely has it:
-            # at least one format <= bucket AND a format that reaches it.
             if min_h <= bucket <= max_h:
                 options[f"v_{bucket}"] = _selector_for_height(bucket)
-    # Small is always offered when a video exists.
     options["v_small"] = SMALL_SELECTOR
     return options
 
@@ -573,11 +574,11 @@ def cleanup_stale_temp_dirs(max_age_seconds: int = 3600) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Downloading (yt-dlp) + ffprobe inspection + remux/re-encode (ffmpeg)
+# Downloading (yt-dlp) + fast remux (ffmpeg -c copy)
 # --------------------------------------------------------------------------- #
 
 def _base_ydl_opts(workdir: str) -> Dict[str, Any]:
-    """Shared yt-dlp options: everything stays in workdir, low-resource friendly."""
+    """Shared yt-dlp options: everything stays in workdir; original quality."""
     return {
         "outtmpl": str(Path(workdir) / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
@@ -604,72 +605,14 @@ def _largest_file(folder: str) -> Optional[str]:
 
 
 def download_video(url: str, workdir: str, selector: str) -> Optional[str]:
-    """Download the raw video into `workdir` using the given format selector."""
+    """Download the raw video into `workdir`. Separate streams are merged with a
+    stream copy into MP4 (merge_output_format), never re-encoded."""
     opts = _base_ydl_opts(workdir)
     opts["format"] = selector
     opts["merge_output_format"] = "mp4"
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
     return _largest_file(workdir)
-
-
-def probe_media(path: str) -> dict:
-    """Return ffprobe JSON (streams + format), or {} on failure (small output)."""
-    cmd = [
-        "ffprobe", "-v", "error", "-print_format", "json",
-        "-show_streams", "-show_format", path,
-    ]
-    try:
-        result = subprocess.run(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        logger.warning("ffprobe unavailable/timeout: %s", exc)
-        return {}
-    if result.returncode != 0:
-        logger.warning("ffprobe rc=%s: %s", result.returncode, (result.stderr or "")[-2000:])
-        return {}
-    try:
-        return json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return {}
-
-
-def _probe_streams(path: str) -> Optional[dict]:
-    """Summarise a media file's container + codecs for the send decision."""
-    info = probe_media(path)
-    if not info:
-        return None
-    fmt = (info.get("format", {}).get("format_name") or "").lower()
-    is_mp4 = path.lower().endswith(".mp4") and ("mp4" in fmt or "mov" in fmt)
-    streams = info.get("streams", [])
-    video = next((s for s in streams if s.get("codec_type") == "video"), None)
-    acodecs = [
-        (s.get("codec_name") or "").lower()
-        for s in streams if s.get("codec_type") == "audio"
-    ]
-    return {
-        "is_mp4": is_mp4,
-        "vcodec": (video.get("codec_name") or "").lower() if video else "",
-        "pix": (video.get("pix_fmt") or "").lower() if video else "",
-        "acodecs": acodecs,
-    }
-
-
-def _is_compatible(streams: Optional[dict]) -> bool:
-    """True when streams are Telegram/mobile-friendly (H.264 + AAC/no-audio)."""
-    if not streams:
-        return False
-    if streams["vcodec"] not in ("h264", "avc1"):
-        return False
-    if streams["pix"] and streams["pix"] != "yuv420p":
-        return False
-    return all(a == "aac" for a in streams["acodecs"])  # empty -> True (no audio)
 
 
 def _run_ffmpeg(cmd: List[str], output_path: str) -> bool:
@@ -704,7 +647,10 @@ def _run_ffmpeg(cmd: List[str], output_path: str) -> bool:
 
 
 def remux_video(input_path: str, output_path: str) -> bool:
-    """Fast path: stream-copy into an MP4 with +faststart (no re-encode)."""
+    """Fast, lossless container fix: STREAM COPY into MP4 with +faststart.
+
+    Uses only ``-c copy`` — no codecs, no scaling, no CRF, no preset.
+    """
     cmd = [
         "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-i", input_path,
@@ -712,7 +658,10 @@ def remux_video(input_path: str, output_path: str) -> bool:
         "-movflags", "+faststart",
         output_path,
     ]
-    return _run_ffmpeg(cmd, output_path)
+    ok = _run_ffmpeg(cmd, output_path)
+    if ok:
+        logger.info("remux ok (stream copy, -c copy, no re-encode)")
+    return ok
 
 
 def normalize_video(
@@ -722,7 +671,8 @@ def normalize_video(
     crf: int = 30,
     audio_bitrate: str = "96k",
 ) -> bool:
-    """Slow fallback: re-encode to H.264/AAC MP4 (only when explicitly allowed)."""
+    """OPT-IN slow fallback (only when NO_VIDEO_COMPRESSION=false AND
+    NO_REENCODE_BY_DEFAULT=false). Re-encodes to H.264/AAC MP4."""
     cmd = [
         "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-threads", "1",
@@ -745,7 +695,9 @@ def normalize_video(
 
 
 def _reencode_params(quality_key: str) -> tuple[Optional[int], int, str]:
-    """(target_height, crf, audio_bitrate) for the optional re-encode fallback."""
+    """(target_height, crf, audio_bitrate) for the opt-in re-encode fallback."""
+    if quality_key == "v_original":
+        return None, 30, "128k"
     if quality_key == "v_small":
         return 360, 32, "96k"
     height = _height_from_key(quality_key)
@@ -768,7 +720,10 @@ def _find_audio_file(folder: str) -> Optional[str]:
 
 
 def download_audio(url: str, workdir: str) -> Optional[str]:
-    """Download the best audio and convert to MP3 (192k) via ffmpeg."""
+    """Download the best audio and convert to MP3 (192k) via ffmpeg.
+
+    Audio conversion stays (it is much lighter than video compression).
+    """
     opts = _base_ydl_opts(workdir)
     opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
     opts["postprocessors"] = [
@@ -791,7 +746,7 @@ def download_audio(url: str, workdir: str) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 
 def show_quality_menu(chat_id: int, url: str) -> None:
-    """Analyze the link and present ONLY the qualities that actually exist."""
+    """Analyze the link and present "الجودة الأصلية" + the available resolutions."""
     options = analyze_video_qualities(url)
     if options is None:
         send_message(chat_id, MSG_FORMATS_UNREADABLE)
@@ -800,7 +755,6 @@ def show_quality_menu(chat_id: int, url: str) -> None:
         send_message(chat_id, MSG_NO_VIDEO)
         return
 
-    # Store the small {callback -> selector} map for this chat (not the info obj).
     last_selectors_by_chat[chat_id] = options
     send_message(
         chat_id, MSG_VIDEO_QUALITY_MENU, reply_markup=quality_keyboard(list(options.keys()))
@@ -811,26 +765,24 @@ def handle_video_request(chat_id: int, url: str, quality_key: str, selector: str
     workdir = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}{chat_id}_")
     try:
         logger.info(
-            "Video request: chat=%s quality=%s fast=%s low_res=%s no_reencode=%s",
-            chat_id, quality_key, FAST_MODE, LOW_RESOURCE_MODE, NO_REENCODE_BY_DEFAULT,
+            "Video request: chat=%s quality=%s no_compression=%s fast=%s",
+            chat_id, quality_key, NO_VIDEO_COMPRESSION, FAST_MODE,
         )
-        if LOW_RESOURCE_MODE and quality_key == "v_720":
-            send_message(chat_id, MSG_720_SLOW)
 
-        # 1) Download with the selected format selector.
+        # 1) Download the original/selected source quality (no compression).
         dl_start = time.monotonic()
         try:
             raw_path = download_video(url, workdir, selector)
         except DownloadError as exc:
             text = str(exc).lower()
             if "requested format" in text or "not available" in text or "no video" in text:
-                send_message(chat_id, MSG_QUALITY_UNAVAILABLE)
+                send_message(chat_id, MSG_NOT_DIRECT)
             else:
                 logger.warning("Video download error: %s", exc)
                 send_message(chat_id, MSG_ERROR)
             return
         if not raw_path or not os.path.exists(raw_path):
-            send_message(chat_id, MSG_QUALITY_UNAVAILABLE)
+            send_message(chat_id, MSG_NOT_DIRECT)
             return
         logger.info(
             "yt-dlp download: %.1fs -> %s (%s)",
@@ -838,55 +790,52 @@ def handle_video_request(chat_id: int, url: str, quality_key: str, selector: str
             _mb(os.path.getsize(raw_path)),
         )
 
-        # 2) Inspect codecs/container with ffprobe.
-        probe_start = time.monotonic()
-        streams = _probe_streams(raw_path)
-        compatible = _is_compatible(streams)
-        logger.info(
-            "ffprobe inspect: %.2fs (compatible=%s, mp4=%s, v=%s, a=%s)",
-            time.monotonic() - probe_start, compatible,
-            streams["is_mp4"] if streams else "?",
-            streams["vcodec"] if streams else "?",
-            ",".join(streams["acodecs"]) if streams else "?",
-        )
-
+        is_mp4 = raw_path.lower().endswith(".mp4")
         output_path = str(Path(workdir) / "video_output.mp4")
-        proc_start = time.monotonic()
 
-        if compatible:
-            send_message(chat_id, MSG_SENDING_VIDEO)
-            if streams["is_mp4"] and FAST_MODE:
-                method = "direct"          # compatible MP4 -> send as-is (no ffmpeg)
-                final_path: Optional[str] = raw_path
-            else:
-                method = "remux"           # compatible streams -> fast remux to mp4
-                final_path = output_path if remux_video(raw_path, output_path) else None
-        elif NO_REENCODE_BY_DEFAULT:
-            # Heavy conversion would be needed; we don't re-encode by default.
-            logger.info("Incompatible and NO_REENCODE_BY_DEFAULT -> ask for lower quality.")
-            send_message(chat_id, MSG_NEEDS_CONVERSION)
-            return
+        # 2) Container fix only: send compatible MP4 directly, else stream-copy
+        #    remux. NEVER re-encode unless explicitly opted in.
+        proc_start = time.monotonic()
+        method = "direct"
+        final_path: Optional[str] = None
+
+        if is_mp4 and FAST_MODE:
+            final_path = raw_path  # already mp4 -> send as-is (fastest)
         else:
-            method = "reencode"
-            send_message(chat_id, MSG_COMPRESSING)
-            th, crf, ab = _reencode_params(quality_key)
-            final_path = output_path if normalize_video(raw_path, output_path, th, crf, ab) else None
+            send_message(chat_id, MSG_REMUXING)
+            if remux_video(raw_path, output_path) and os.path.exists(output_path):
+                method = "remux"
+                final_path = output_path
+            elif is_mp4:
+                # Faststart remux failed but it's already mp4 -> send the original.
+                final_path = raw_path
+            elif not NO_VIDEO_COMPRESSION and not NO_REENCODE_BY_DEFAULT:
+                # Opt-in slow fallback (off by default).
+                method = "reencode"
+                send_message(chat_id, MSG_COMPRESSING)
+                th, crf, ab = _reencode_params(quality_key)
+                final_path = output_path if normalize_video(raw_path, output_path, th, crf, ab) else None
+            else:
+                logger.info("Remux failed and compression disabled -> ask the user.")
+                send_message(chat_id, MSG_REMUX_FAILED)
+                return
 
         if not final_path or not os.path.exists(final_path):
-            send_message(chat_id, MSG_VIDEO_PROCESS_FAILED)
+            send_message(chat_id, MSG_REMUX_FAILED)
             return
-        logger.info("%s done: %.1fs", method, time.monotonic() - proc_start)
+        logger.info("%s: %.1fs", method, time.monotonic() - proc_start)
 
-        # 3) Enforce the Telegram size limit on the FINAL file.
+        # 3) 49 MB guard — do NOT compress; reject instead.
         final_size = os.path.getsize(final_path)
         logger.info("Final file: %s (%s) method=%s", os.path.basename(final_path), _mb(final_size), method)
         if final_size > MAX_FILE_SIZE:
-            send_message(chat_id, MSG_TOO_LARGE_VIDEO)
+            send_message(chat_id, MSG_TOO_LARGE_ORIGINAL)
             return
 
-        # 4) Send ONCE via sendVideo (a document copy only if explicitly enabled).
+        # 4) Send ONCE via sendVideo (document copy only if explicitly enabled).
+        send_message(chat_id, MSG_SENDING_VIDEO)
         up_start = time.monotonic()
-        sent = send_video(chat_id, final_path, caption=MSG_VIDEO_DONE)
+        sent = send_video(chat_id, final_path, caption=MSG_VIDEO_DONE_ORIGINAL)
         logger.info(
             "Telegram upload: %.1fs (%s, method=%s)",
             time.monotonic() - up_start, _mb(final_size), method,
@@ -991,15 +940,12 @@ def handle_callback(callback: dict) -> None:
         show_quality_menu(chat_id, url)
         return
 
-    # Step 2: a concrete video quality -> guarded download.
+    # Step 2: a concrete video quality (incl. v_original) -> guarded download.
     if action in VIDEO_QUALITY_KEYS:
-        if LOW_RESOURCE_MODE and action == "v_1080":
-            send_message(chat_id, MSG_1080_BLOCKED_LOWRES)
-            return
         selector = last_selectors_by_chat.get(chat_id, {}).get(action) or _selector_from_callback(action)
         _run_guarded_download(
             chat_id,
-            MSG_PREPARING,
+            MSG_DOWNLOADING_ORIGINAL,
             lambda: handle_video_request(chat_id, url, action, selector),
         )
         return
@@ -1035,8 +981,8 @@ async def lifespan(_: FastAPI):
     validate_config()
     cleanup_stale_temp_dirs()
     logger.info(
-        "Flags: FAST_MODE=%s LOW_RESOURCE_MODE=%s NO_REENCODE_BY_DEFAULT=%s SEND_VIDEO_AS_FILE_COPY=%s",
-        FAST_MODE, LOW_RESOURCE_MODE, NO_REENCODE_BY_DEFAULT, SEND_VIDEO_AS_FILE_COPY,
+        "Flags: NO_VIDEO_COMPRESSION=%s FAST_MODE=%s NO_REENCODE_BY_DEFAULT=%s SEND_VIDEO_AS_FILE_COPY=%s",
+        NO_VIDEO_COMPRESSION, FAST_MODE, NO_REENCODE_BY_DEFAULT, SEND_VIDEO_AS_FILE_COPY,
     )
     register_webhook()
     yield

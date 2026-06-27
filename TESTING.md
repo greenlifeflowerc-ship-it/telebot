@@ -72,8 +72,8 @@ Then test the bot in Telegram:
 1. Send `/start` → Arabic welcome message.
 2. Send a public link → two buttons: **تحميل فيديو** / **تحميل صوت MP3**.
 3. Tap **تحميل فيديو** → menu `اختر دقة الفيديو المتاحة:` (see section 5).
-4. Pick a quality → `جاري تجهيز الفيديو...`, then `جاري إرسال الفيديو...` (fast
-   remux) or `جاري ضغط الفيديو ليتوافق مع تلغرام...` (re-encode), then the file.
+4. Pick a quality → `جاري تحميل الفيديو بالدقة الأصلية...`, then (for non-MP4)
+   `جاري تحويل الصيغة بسرعة بدون ضغط...`, then `جاري إرسال الفيديو...`, then the file.
 5. Tap **تحميل صوت MP3** → `⏳ جاري التحميل...` then an MP3.
 6. Tap again while a download is running → `يوجد تحميل قيد التنفيذ حالياً...`.
 
@@ -126,60 +126,63 @@ If a platform suddenly stops working, update `yt-dlp` by redeploying
 ## 5. Test video quality options (only available ones)
 
 1. Send a public link, then tap **تحميل فيديو**.
-2. The bot replies `اختر دقة الفيديو المتاحة:` (with the
-   `الأسرع هو اختيار 480p أو 360p بدون ضغط` note) and shows **only the
-   resolutions that exist** for that link — possible: 1080p · 720p · 480p ·
-   360p · 240p · أقل حجم (Small). There is **no Full/original button**.
+2. The bot replies `اختر دقة الفيديو المتاحة:` with a full-width
+   **الجودة الأصلية** button on top, then **only the resolutions that exist**
+   (1080p · 720p · 480p · 360p · 240p · أقل حجم / Small).
 
 What to verify:
 
 | Action | Expected |
 | ------ | -------- |
-| Send a **YouTube** link | Menu shows the resolutions YouTube actually offers (e.g. 1080p/720p/480p/360p/240p/Small). No fake buttons. |
-| Send a **TikTok / Instagram** link | Only the resolution(s) that exist appear; often just **Small** (single-format sources). |
-| `LOW_RESOURCE_MODE=true` | **1080p never appears**, even if the link has it. |
-| Tap **480p** / **360p** | Downloads that resolution; logs show `method=direct` or `method=remux` (no re-encode). |
-| Tap **أقل حجم / Small** | Smallest file (`worst[ext=mp4]/worst`). |
-| Link whose formats can't be read | `لم أستطع قراءة الدقات المتاحة...` then a safe fallback menu (720p/480p/360p/Small). |
+| Send a **YouTube** link | Menu shows **الجودة الأصلية** + the resolutions YouTube actually offers. No fake buttons. |
+| Send a **TikTok / Instagram** link | **الجودة الأصلية** + only the resolution(s) that exist (often just Small). |
+| Tap **الجودة الأصلية** | Downloads best original quality; logs show `method=direct` or `method=remux` — **never** a re-encode. |
+| Tap **480p** / **360p** | Selects the closest real source format (no scaling, no re-encode). |
+| A picked quality not directly available | `هذه الدقة غير متاحة مباشرة من المصدر.` |
+| Link whose formats can't be read | `لم أستطع قراءة الدقات المتاحة...` then a safe fallback (Original/720p/480p/360p/Small). |
 | Link with no video | `لا يوجد فيديو متاح لهذا الرابط...` |
-| Final file > 49 MB | `الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 480p أو 360p.` (not sent). |
+| **Original** file > 49 MB | `الفيديو بالدقة الأصلية أكبر من حد تلغرام للبوت...` — **rejected, not compressed**. |
 
 Tip: a long 4K/1080p YouTube video is an easy way to trigger the > 49 MB path;
 a short clip is an easy way to confirm a successful send.
 
 ---
 
-## 6. Verify mobile / Telegram compatibility (normalization)
+## 6. Verify NO compression — original quality + fast remux
 
-Every video is re-encoded with ffmpeg before sending, so it plays correctly in
-the Telegram player and saves correctly to the gallery.
+The bot must never compress/re-encode video; it downloads the original and only
+stream-copies the container to MP4.
 
 What to verify:
-- The received video **plays with both image and sound** (not audio-only with a
-  frozen frame) — including links that originally served **VP9 / AV1 / WebM**.
-- **Saving** the video to the phone gallery produces a normal, playable MP4.
-- It always arrives via **`sendVideo`** (inline player), not as a file/document.
+- The received video is sent via **`sendVideo`** (inline player), once, never as
+  a document.
+- **Original quality is preserved.** Download the sent file and compare its
+  resolution/bitrate to the source — they match (no downscale, no quality loss).
+- **Logs confirm `-c copy`, no `libx264`.** A non-MP4 source logs
+  `remux ok (stream copy, -c copy, no re-encode)`; you must **never** see
+  `ffmpeg re-encode ok` while `NO_VIDEO_COMPRESSION=true`. Confirm with ffprobe
+  that the sent video's codec equals the source's (e.g. h264 stays h264).
+- **Remux is fast** — a fraction of a second (vs many seconds/minutes for a
+  re-encode).
 
-Check the Render logs for the diagnostic trail of one video request (no secrets
-are logged):
+Diagnostic trail of one video request (no secrets are logged):
 
 ```
-Video request: chat=... quality=720 fast=True low_res=True
+Video request: chat=... quality=v_original no_compression=True fast=True
 yt-dlp download: 6.4s -> <title>-<id>.mp4 (8.1 MB)
-ffprobe inspect: 0.05s (compatible=True)
-remux: 0.3s
-Final file: normalized_output.mp4 (8.1 MB)
-Telegram upload: 2.1s (8.1 MB, method=remux)
+direct: 0.0s                       # already MP4 + FAST_MODE -> sent as-is
+Final file: <title>-<id>.mp4 (8.1 MB) method=direct
+Telegram upload: 2.1s (8.1 MB, method=direct)
 Cleaned temp folder for chat_id=...
 ```
 
-If processing fails, you get `تعذّرت معالجة الفيديو لجعله متوافقًا مع
-تيليجرام...` instead of a broken video. Confirm ffmpeg/ffprobe are installed —
-they are provided by the Docker image, so this should only happen on a broken
-source.
+For a non-MP4 (WebM/MKV) source the middle line becomes
+`remux ok (stream copy, -c copy, no re-encode)` then `remux: 0.Xs`. If the remux
+genuinely fails the bot replies `تعذر تحويل صيغة الفيديو بدون ضغط...` and does
+**not** compress.
 
-> Local note: re-encoding needs **ffmpeg on your PATH** when running without
-> Docker. On Render it is already in the image.
+> Local note: remux needs **ffmpeg on your PATH** when running without Docker.
+> On Render it is already in the image.
 
 ---
 
@@ -230,52 +233,31 @@ touch -d '2 hours ago' "$(python -c 'import tempfile;print(tempfile.gettempdir()
 
 ---
 
-## 8. Verify low-resource mode (Render Free 512 MB)
-
-Set `LOW_RESOURCE_MODE=true` (env var) and restart. The startup log shows the
-flags line, e.g. `Flags: FAST_MODE=True LOW_RESOURCE_MODE=True ...`.
-
-What to verify:
-- Tap **تحميل فيديو** on a link that has 1080p → **1080p does not appear** in the
-  menu (other available resolutions still do).
-- Pick **720p** → first shows `قد يستغرق تحميل 720p وقتاً أطول على الخطة المجانية.`
-- If a `v_1080` callback is somehow sent (e.g. an old keyboard), the bot replies
-  `دقة 1080p غير متاحة على الخطة المجانية...`.
-- **Global lock:** start a download in one chat, then immediately request one
-  from a **different** chat → the second gets
-  `السيرفر يعالج طلباً آخر حالياً، حاول بعد قليل.`
-
-With `LOW_RESOURCE_MODE` unset/`false` (bigger instance), 1080p appears whenever
-the link actually has it.
-
----
-
-## 9. Verify speed (direct/remux, no re-encode by default)
+## 8. Verify no-compression speed + large-file rejection
 
 Startup logs the flags, e.g.
-`Flags: FAST_MODE=True LOW_RESOURCE_MODE=True NO_REENCODE_BY_DEFAULT=True SEND_VIDEO_AS_FILE_COPY=False`.
+`Flags: NO_VIDEO_COMPRESSION=True FAST_MODE=True NO_REENCODE_BY_DEFAULT=True SEND_VIDEO_AS_FILE_COPY=False`.
 
-- **Choose 480p on a YouTube link → no heavy re-encode.** The logs should show
-  `compatible=True` and `method=direct` (FAST_MODE) or `method=remux` — **never**
-  `ffmpeg re-encode ok`. Processing time is ~0s (direct) or a fraction of a
-  second (remux):
-  ```
-  yt-dlp download: 5.1s -> <id>.mp4 (6.0 MB)
-  ffprobe inspect: 0.05s (compatible=True, mp4=True, v=h264, a=aac)
-  direct done: 0.0s
-  Telegram upload: 1.8s (6.0 MB, method=direct)
-  ```
-- **sendVideo only — never sendDocument.** The video arrives as an inline,
-  playable video, **not** a file attachment. With `SEND_VIDEO_AS_FILE_COPY=false`
-  (default) there is exactly one upload; the logs show a single
-  `Telegram upload` line for the video and no `sendDocument`.
-- **Incompatible source with `NO_REENCODE_BY_DEFAULT=true`.** A VP9/AV1-only link
-  shows `compatible=False` and the bot replies
-  `هذا الفيديو يحتاج تحويل وقد يستغرق وقتاً طويلاً على الخطة المجانية. جرّب دقة أقل.`
-  — it does **not** spend minutes re-encoding.
-- **Optional re-encode fallback.** Only with `NO_REENCODE_BY_DEFAULT=false` does
-  an incompatible source get `جاري ضغط الفيديو...` and
-  `ffmpeg re-encode ok (height=... crf=30)`.
+- **Original downloads without compression.** Tap **الجودة الأصلية** on a
+  YouTube link. Logs show `method=direct` (already MP4 + FAST_MODE) or
+  `method=remux` — **never** `ffmpeg re-encode ok`. The sent file's resolution
+  matches the source.
+- **`-c copy` only / no `libx264`.** For a non-MP4 source the log line
+  `remux ok (stream copy, -c copy, no re-encode)` appears. Grepping logs for
+  `libx264` or `re-encode` returns nothing while `NO_VIDEO_COMPRESSION=true`.
+- **Remux is fast.** `direct: 0.0s` or `remux: 0.Xs` — not minutes.
+- **sendVideo only — never sendDocument.** Exactly one `Telegram upload` line per
+  video; no `sendDocument` (unless `SEND_VIDEO_AS_FILE_COPY=true`).
+- **Large originals are rejected, not compressed.** Pick **الجودة الأصلية** on a
+  long 1080p/4K video so the file exceeds 49 MB. The bot replies
+  `الفيديو بالدقة الأصلية أكبر من حد تلغرام للبوت...` and sends nothing — it does
+  **not** re-encode to shrink it. Then pick **480p/360p** and confirm it sends.
+- **Temp cleanup still happens** after every outcome (see section 7) — the log
+  ends with `Cleaned temp folder for chat_id=...`.
 
-`FAST_MODE=false` swaps direct-send for a fast remux (still no re-encode) — handy
-to compare `method=direct` vs `method=remux` timings.
+The only opt-in re-encode path requires **both** `NO_VIDEO_COMPRESSION=false`
+**and** `NO_REENCODE_BY_DEFAULT=false`; only then can `ffmpeg re-encode ok`
+appear (after `جاري ضغط الفيديو...`).
+
+`FAST_MODE=false` swaps direct-send for a stream-copy remux (still no re-encode)
+— handy to compare `method=direct` vs `method=remux` timings.
