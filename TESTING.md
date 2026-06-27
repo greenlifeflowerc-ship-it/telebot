@@ -106,9 +106,14 @@ Send any of these **public** link shapes to the bot, then choose video or audio:
 
 What to verify:
 - A **non-allowed** link (e.g. a plain website) → `❌ الرابط غير مدعوم.`
-- A short clip → video arrives via `sendVideo` (mp4) or `sendDocument`.
-- Audio button → an `.mp3` arrives via `sendAudio`.
-- A **large** file (> ~49 MB) → `⚠️ حجم الملف أكبر من الحد المسموح...` (not sent).
+- A short clip → a normalized mp4 arrives via `sendVideo` with caption
+  `تم تحميل الفيديو.` It should **play with image (not frozen)** and **save
+  correctly to the phone gallery**.
+- Audio button → an `.mp3` arrives via `sendAudio`. If MP3 conversion fails you
+  instead get the raw audio as a document with
+  `تم تحميل الصوت، لكن لم أستطع تحويله إلى MP3.`; if nothing downloads →
+  `فشل تحميل الصوت. جرّب رابط آخر أو تأكد أن الرابط عام.`
+- A **large** file (> ~49 MB after normalization) → not sent; try a lower quality.
 - **Private / login-required** content → fails by design with the Arabic error
   message. This bot does not bypass logins or restrictions.
 
@@ -139,3 +144,34 @@ What to verify:
 
 Tip: a long 4K/1080p YouTube video is an easy way to trigger the > 49 MB path;
 a short clip is an easy way to confirm a successful send.
+
+---
+
+## 6. Verify mobile / Telegram compatibility (normalization)
+
+Every video is re-encoded with ffmpeg before sending, so it plays correctly in
+the Telegram player and saves correctly to the gallery.
+
+What to verify:
+- The received video **plays with both image and sound** (not audio-only with a
+  frozen frame) — including links that originally served **VP9 / AV1 / WebM**.
+- **Saving** the video to the phone gallery produces a normal, playable MP4.
+- It always arrives via **`sendVideo`** (inline player), not as a file/document.
+
+Check the Render logs for the diagnostic trail of one video request (no secrets
+are logged):
+
+```
+Video request: chat=... quality=720
+Raw download: <id>.webm (12.3 MB)
+ffmpeg normalization ok (target_height=720)
+Normalized: normalized.mp4 (9.8 MB)
+Sending via sendVideo
+```
+
+If normalization itself fails, you get `تعذّرت معالجة الفيديو لجعله متوافقًا مع
+تيليجرام...` instead of a broken video. Confirm ffmpeg is installed — it is
+provided by the Docker image, so this should only happen on a broken/odd source.
+
+> Local note: re-encoding needs **ffmpeg on your PATH** when running without
+> Docker. On Render it is already in the image.

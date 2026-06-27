@@ -13,9 +13,11 @@ User sends a link  ->  [تحميل فيديو] / [تحميل صوت MP3]
                    1080p/720p/480p/360p/         |
                    Small)                    sendAudio
                               |
-                    yt-dlp + ffmpeg download
+                       yt-dlp download
                               |
-                  sendVideo (mp4) / sendDocument
+            ffmpeg normalize -> MP4 (H.264 + AAC, yuv420p)
+                              |
+                         sendVideo
 ```
 
 ---
@@ -201,9 +203,10 @@ app's job.
 
 ### 2. Telegram bot file-size limit
 Bots can only **send files up to 50 MB** via the Bot API. This project refuses
-anything over **~49 MB** and replies with an Arabic "file too large" message.
-Use a shorter clip or lower quality. (Raising this limit would require a local
-Bot API server, which is out of scope here.)
+anything over **~49 MB** (checked on the final, normalized file) and replies with
+an Arabic message. If **Full** quality is too large, pick **720p** or **480p**;
+long or high-quality videos can still exceed the limit even after re-encoding.
+(Raising this limit would require a local Bot API server, which is out of scope.)
 
 ### 3. Private Instagram / TikTok links may fail
 Only **public** content works. Private, age-restricted, region-locked, or
@@ -249,6 +252,32 @@ resolutions that link can actually provide:
 
 The two helpers driving this are `get_available_quality_options(url)` and
 `build_video_format_selector(quality)` in [main.py](main.py).
+
+---
+
+## 📱 Mobile / Telegram compatibility (normalization)
+
+Some sources hand back codecs/containers that the Telegram player and phone
+galleries handle poorly — **VP9 / AV1 / WebM**, 10-bit pixel formats, or badly
+muxed MP4. That is what caused frozen-image-but-audio-plays videos and clips
+that didn't appear correctly in the gallery after saving.
+
+To fix this, **every video is re-encoded with ffmpeg before sending**, even when
+yt-dlp already produced an mp4:
+
+- Container **`.mp4`**, video **H.264 (libx264, profile main)**, audio **AAC 128k**
+- Pixel format **`yuv420p`** and **`-movflags +faststart`** (instant playback / streaming)
+- Selected height kept for **1080p/720p/480p/360p** (scaled down only, never upscaled);
+  **Full** keeps the original resolution; a video with no audio still yields a valid MP4
+- Format selection now **prefers mp4 / H.264 (`avc1`)** before falling back, so the
+  raw file is already friendly when possible
+- The raw yt-dlp file is **never sent directly**; if normalization fails the bot
+  replies in Arabic instead of sending a broken video
+- The final, normalized file is checked against the **49 MB** limit and sent with
+  `sendVideo` (`supports_streaming=true`, `video/mp4`)
+
+If **Full** quality is too large for Telegram, pick **720p** or **480p**. Long or
+high-quality videos can still exceed the 49 MB bot limit even after normalization.
 
 ---
 

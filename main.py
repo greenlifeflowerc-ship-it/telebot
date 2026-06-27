@@ -3,8 +3,12 @@ Telegram video / audio downloader bot — webhook architecture for Render Web Se
 
 The user sends a public video URL (YouTube / TikTok / Instagram) and the bot
 replies with two inline buttons:
-    1. تحميل فيديو      -> choose a video quality, then download (mp4 preferred)
+    1. تحميل فيديو      -> choose a video quality, then download
     2. تحميل صوت MP3     -> extract the audio and convert it to MP3
+
+Every video is re-encoded with ffmpeg to a Telegram/mobile-compatible MP4
+(H.264 + AAC, yuv420p, +faststart) before sending, so it plays correctly in the
+Telegram player and saves correctly to the phone gallery.
 
 This app is built for WEBHOOK deployment (NOT long polling), so it runs cleanly
 as a Render Web Service behind FastAPI + Uvicorn. The webhook handler returns to
@@ -18,6 +22,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 from contextlib import asynccontextmanager
@@ -87,6 +92,8 @@ QUALITY_ORDER: List[str] = ["full", "1080", "720", "480", "360", "small"]
 FALLBACK_QUALITIES: List[str] = ["full", "720", "480", "small"]
 # callback_data ("v_full" ...) -> quality key ("full" ...).
 VIDEO_QUALITY_ACTIONS: Dict[str, str] = {f"v_{key}": key for key in QUALITY_LABELS}
+# Target output height for the normalize step (None = keep original resolution).
+QUALITY_TARGET_HEIGHTS: Dict[str, int] = {"1080": 1080, "720": 720, "480": 480, "360": 360}
 
 # Per-chat memory of the last URL the user sent. In-memory only: cleared on
 # every restart / redeploy, which is fine for this simple flow.
@@ -102,6 +109,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("downloader-bot")
+
+
+def _mb(num_bytes: int) -> str:
+    """Human-friendly MB string for logs."""
+    return f"{num_bytes / (1024 * 1024):.1f} MB"
 
 
 # --------------------------------------------------------------------------- #
@@ -128,6 +140,10 @@ MSG_MAYBE_TOO_LARGE = (
     "⚠️ الحجم المتوقع كبير وقد يتجاوز حد تلغرام (حوالي 50 ميجابايت)، "
     "سأحاول التحميل على أي حال."
 )
+MSG_VIDEO_DONE = "تم تحميل الفيديو."
+MSG_VIDEO_PROCESS_FAILED = (
+    "تعذّرت معالجة الفيديو لجعله متوافقًا مع تيليجرام. جرّب دقة أخرى أو رابطًا آخر."
+)
 MSG_TOO_LARGE = (
     "⚠️ حجم الملف أكبر من الحد المسموح به في تيليجرام (حوالي 50 ميجابايت)، "
     "لذلك لا يمكن إرساله.\nجرّب فيديو أقصر أو جودة أقل."
@@ -135,6 +151,8 @@ MSG_TOO_LARGE = (
 MSG_TOO_LARGE_TRY_LOWER = (
     "الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 720p أو 480p."
 )
+MSG_AUDIO_NO_MP3 = "تم تحميل الصوت، لكن لم أستطع تحويله إلى MP3."
+MSG_AUDIO_FAILED = "فشل تحميل الصوت. جرّب رابط آخر أو تأكد أن الرابط عام."
 MSG_ERROR = (
     "حدث خطأ أثناء المعالجة.\n"
     "تأكد أن الرابط عام وصحيح ثم حاول مرة أخرى."
@@ -178,34 +196,51 @@ def answer_callback(callback_query_id: str, text: Optional[str] = None) -> None:
     _api("answerCallbackQuery", json=payload)
 
 
-def send_video(chat_id: int, path: str) -> None:
+def send_video(chat_id: int, path: str, caption: Optional[str] = None) -> bool:
+    """Send an MP4 via sendVideo (streamable, video/mp4). Returns success."""
+    filename = os.path.basename(path)
     with open(path, "rb") as fh:
-        _api(
+        data: Dict[str, Any] = {"chat_id": str(chat_id), "supports_streaming": "true"}
+        if caption:
+            data["caption"] = caption
+        resp = _api(
             "sendVideo",
-            data={"chat_id": str(chat_id), "supports_streaming": "true"},
-            files={"video": fh},
+            data=data,
+            files={"video": (filename, fh, "video/mp4")},
             timeout=600,
         )
+    return bool(resp and resp.get("ok"))
 
 
-def send_document(chat_id: int, path: str) -> None:
+def send_document(chat_id: int, path: str, caption: Optional[str] = None) -> bool:
+    filename = os.path.basename(path)
     with open(path, "rb") as fh:
-        _api(
+        data: Dict[str, Any] = {"chat_id": str(chat_id)}
+        if caption:
+            data["caption"] = caption
+        resp = _api(
             "sendDocument",
-            data={"chat_id": str(chat_id)},
-            files={"document": fh},
+            data=data,
+            files={"document": (filename, fh)},
             timeout=600,
         )
+    return bool(resp and resp.get("ok"))
 
 
-def send_audio(chat_id: int, path: str) -> None:
+def send_audio(chat_id: int, path: str, caption: Optional[str] = None) -> bool:
+    """Send an MP3 via sendAudio (audio/mpeg). Returns success."""
+    filename = os.path.basename(path)
     with open(path, "rb") as fh:
-        _api(
+        data: Dict[str, Any] = {"chat_id": str(chat_id)}
+        if caption:
+            data["caption"] = caption
+        resp = _api(
             "sendAudio",
-            data={"chat_id": str(chat_id)},
-            files={"audio": fh},
+            data=data,
+            files={"audio": (filename, fh, "audio/mpeg")},
             timeout=600,
         )
+    return bool(resp and resp.get("ok"))
 
 
 # --------------------------------------------------------------------------- #
@@ -396,24 +431,31 @@ def get_available_quality_options(url: str) -> Optional[List[str]]:
 
 
 def build_video_format_selector(quality: str) -> str:
-    """Map a quality key to a yt-dlp format selector string."""
+    """Map a quality key to a yt-dlp format selector string.
+
+    Prefers mp4 / H.264 (avc1) formats before falling back, so the raw download
+    is already mobile-friendly when possible (normalization still runs after).
+    """
     selectors = {
-        "full": "bestvideo+bestaudio/best",
+        "full": (
+            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "best[ext=mp4][vcodec^=avc1]/bestvideo+bestaudio/best"
+        ),
         "1080": (
-            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=1080][ext=mp4]/best[height<=1080]"
+            "bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "best[height<=1080][ext=mp4][vcodec^=avc1]/best[height<=1080]"
         ),
         "720": (
-            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=720][ext=mp4]/best[height<=720]"
+            "bestvideo[height<=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "best[height<=720][ext=mp4][vcodec^=avc1]/best[height<=720]"
         ),
         "480": (
-            "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=480][ext=mp4]/best[height<=480]"
+            "bestvideo[height<=480][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "best[height<=480][ext=mp4][vcodec^=avc1]/best[height<=480]"
         ),
         "360": (
-            "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=360][ext=mp4]/best[height<=360]"
+            "bestvideo[height<=360][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "best[height<=360][ext=mp4][vcodec^=avc1]/best[height<=360]"
         ),
         "small": "worst[ext=mp4]/worst",
     }
@@ -421,7 +463,7 @@ def build_video_format_selector(quality: str) -> str:
 
 
 def estimate_video_size(url: str, quality: str) -> Optional[int]:
-    """Best-effort estimated size (bytes) for the chosen quality, or None.
+    """Best-effort estimated raw size (bytes) for the chosen quality, or None.
 
     Uses filesize / filesize_approx from yt-dlp without downloading. The info
     object is discarded immediately and never stored.
@@ -472,7 +514,7 @@ def end_download(chat_id: int) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Downloading (yt-dlp + ffmpeg)
+# Downloading (yt-dlp) + normalization (ffmpeg)
 # --------------------------------------------------------------------------- #
 
 def _largest_file(folder: str) -> Optional[str]:
@@ -488,7 +530,7 @@ def _largest_file(folder: str) -> Optional[str]:
 
 
 def download_video(url: str, folder: str, quality: str = "720") -> Optional[str]:
-    """Download the video into `folder` using the selector for `quality`."""
+    """Download the raw video into `folder` using the selector for `quality`."""
     opts: Dict[str, Any] = {
         "format": build_video_format_selector(quality),
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
@@ -503,10 +545,70 @@ def download_video(url: str, folder: str, quality: str = "720") -> Optional[str]
     return _largest_file(folder)
 
 
+def normalize_video(
+    input_path: str, output_path: str, target_height: Optional[int] = None
+) -> bool:
+    """Re-encode `input_path` to a Telegram/mobile-compatible MP4.
+
+    H.264 (libx264, profile main, yuv420p) + AAC, +faststart. Audio is optional
+    (-map 0:a?) so a video with no audio still produces a valid MP4. When
+    target_height is set the video is scaled down to it (never upscaled), keeping
+    aspect ratio with even dimensions. Returns True on success.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-map", "0:v:0", "-map", "0:a?",
+    ]
+    if target_height:
+        # Downscale only: height = min(target, input height); width auto (even).
+        cmd += ["-vf", f"scale=-2:min({target_height}\\,ih)"]
+    cmd += [
+        "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except FileNotFoundError:
+        logger.error("ffmpeg not found on PATH; cannot normalize video.")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg normalization timed out.")
+        return False
+
+    if result.returncode != 0:
+        tail = (result.stderr or "")[-500:]
+        logger.warning("ffmpeg failed (rc=%s): %s", result.returncode, tail)
+        return False
+
+    logger.info("ffmpeg normalization ok (target_height=%s)", target_height)
+    return True
+
+
+def _find_audio_file(folder: str) -> Optional[str]:
+    """Prefer the converted .mp3, then any other audio container produced."""
+    names = os.listdir(folder)
+    for name in names:
+        if name.lower().endswith(".mp3"):
+            return os.path.join(folder, name)
+    for ext in (".m4a", ".webm", ".opus", ".aac", ".ogg", ".mka"):
+        for name in names:
+            if name.lower().endswith(ext):
+                return os.path.join(folder, name)
+    return _largest_file(folder)
+
+
 def download_audio(url: str, folder: str) -> Optional[str]:
-    """Download the best audio and convert it to MP3 via ffmpeg."""
+    """Download the best audio and convert to MP3 (192k) via ffmpeg.
+
+    Returns the resulting file path. If the MP3 conversion failed but a raw
+    audio file was produced, that path is returned instead (caller handles it).
+    """
     opts: Dict[str, Any] = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -520,13 +622,12 @@ def download_audio(url: str, folder: str) -> Optional[str]:
             }
         ],
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-    # The post-processor leaves a single .mp3 behind.
-    for name in os.listdir(folder):
-        if name.lower().endswith(".mp3"):
-            return os.path.join(folder, name)
-    return _largest_file(folder)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:  # noqa: BLE001 - keep any partial audio for fallback
+        logger.warning("Audio download/convert raised: %s", exc)
+    return _find_audio_file(folder)
 
 
 # --------------------------------------------------------------------------- #
@@ -548,14 +649,18 @@ def show_quality_menu(chat_id: int, url: str) -> None:
 def handle_video_request(chat_id: int, url: str, quality: str) -> None:
     folder = tempfile.mkdtemp(prefix="dlbot_")
     try:
+        logger.info("Video request: chat=%s quality=%s", chat_id, quality)
+
         # Best-effort pre-check: warn (but still proceed) on a large estimate,
         # since estimates are often wrong — especially for "Full".
         estimate = estimate_video_size(url, quality)
         if estimate and estimate > MAX_FILE_SIZE:
+            logger.info("Pre-download estimate %s exceeds limit", _mb(estimate))
             send_message(chat_id, MSG_MAYBE_TOO_LARGE)
 
+        # 1) Download the raw file.
         try:
-            path = download_video(url, folder, quality)
+            raw_path = download_video(url, folder, quality)
         except DownloadError as exc:
             text = str(exc).lower()
             if "requested format" in text or "not available" in text or "no video" in text:
@@ -565,18 +670,40 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
                 send_message(chat_id, MSG_ERROR)
             return
 
-        if not path or not os.path.exists(path):
+        if not raw_path or not os.path.exists(raw_path):
             send_message(chat_id, MSG_QUALITY_UNAVAILABLE)
             return
-        if os.path.getsize(path) > MAX_FILE_SIZE:
+        logger.info(
+            "Raw download: %s (%s)", os.path.basename(raw_path),
+            _mb(os.path.getsize(raw_path)),
+        )
+
+        # 2) Normalize to a Telegram/mobile-compatible MP4. We never send the
+        #    raw file directly — a broken codec is the bug we are fixing.
+        normalized_path = os.path.join(folder, "normalized.mp4")
+        target_height = QUALITY_TARGET_HEIGHTS.get(quality)
+        if not normalize_video(raw_path, normalized_path, target_height) or not os.path.exists(
+            normalized_path
+        ):
+            send_message(chat_id, MSG_VIDEO_PROCESS_FAILED)
+            return
+
+        final_size = os.path.getsize(normalized_path)
+        logger.info(
+            "Normalized: %s (%s)", os.path.basename(normalized_path), _mb(final_size)
+        )
+
+        # 3) Enforce the Telegram size limit on the FINAL file.
+        if final_size > MAX_FILE_SIZE:
             send_message(chat_id, MSG_TOO_LARGE_TRY_LOWER)
             return
-        if path.lower().endswith(".mp4"):
-            send_video(chat_id, path)
-        else:
-            send_document(chat_id, path)
+
+        # 4) Send as a streamable video.
+        logger.info("Sending via sendVideo")
+        if not send_video(chat_id, normalized_path, caption=MSG_VIDEO_DONE):
+            send_message(chat_id, MSG_ERROR)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Video download failed: %s", exc)
+        logger.warning("Video request failed: %s", exc)
         send_message(chat_id, MSG_ERROR)
     finally:
         shutil.rmtree(folder, ignore_errors=True)
@@ -585,17 +712,30 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
 def handle_audio_request(chat_id: int, url: str) -> None:
     folder = tempfile.mkdtemp(prefix="dlbot_")
     try:
+        logger.info("Audio request: chat=%s", chat_id)
         path = download_audio(url, folder)
         if not path or not os.path.exists(path):
-            send_message(chat_id, MSG_ERROR)
+            send_message(chat_id, MSG_AUDIO_FAILED)
             return
-        if os.path.getsize(path) > MAX_FILE_SIZE:
+
+        size = os.path.getsize(path)
+        logger.info("Audio file: %s (%s)", os.path.basename(path), _mb(size))
+        if size > MAX_FILE_SIZE:
             send_message(chat_id, MSG_TOO_LARGE)
             return
-        send_audio(chat_id, path)
+
+        if path.lower().endswith(".mp3"):
+            logger.info("Sending via sendAudio")
+            if not send_audio(chat_id, path):
+                logger.info("sendAudio failed; falling back to sendDocument")
+                send_document(chat_id, path)
+        else:
+            # MP3 conversion didn't happen; send the raw audio as a document.
+            logger.info("MP3 missing; sending raw audio via sendDocument")
+            send_document(chat_id, path, caption=MSG_AUDIO_NO_MP3)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Audio download failed: %s", exc)
-        send_message(chat_id, MSG_ERROR)
+        logger.warning("Audio request failed: %s", exc)
+        send_message(chat_id, MSG_AUDIO_FAILED)
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
@@ -660,7 +800,7 @@ def handle_callback(callback: dict) -> None:
         )
         return
 
-    # Audio path is unchanged.
+    # Audio path.
     if action == "audio":
         _run_guarded_download(
             chat_id,
