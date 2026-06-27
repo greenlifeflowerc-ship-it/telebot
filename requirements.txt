@@ -1,0 +1,14 @@
+# Web framework + ASGI server
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# Direct Telegram Bot API calls + uploads
+requests>=2.31.0
+
+# Media downloader. Left unpinned on purpose: platforms (YouTube/TikTok/Instagram)
+# change often and yt-dlp ships frequent fixes, so each build should pull the
+# latest. Pin a version here only if you need fully reproducible builds.
+yt-dlp
+
+# Loads a local .env during development (ignored on Render, which injects env vars)
+python-dotenv>=1.0.0

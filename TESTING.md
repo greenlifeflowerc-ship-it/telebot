@@ -1,0 +1,109 @@
+# Testing Guide
+
+How to test the bot locally, verify the webhook after a Render deploy, read
+logs, and try real public links.
+
+> Reminder: only test with content you own or have permission to download.
+
+---
+
+## 1. Test locally with uvicorn
+
+```bash
+# 1. Install deps (ffmpeg must also be installed and on your PATH)
+pip install -r requirements.txt
+
+# 2. Configure env
+cp .env.example .env
+#    Edit .env and set BOT_TOKEN, WEBHOOK_SECRET, and PUBLIC_URL.
+
+# 3. Run the server
+uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}
+```
+
+Quick checks (in another terminal):
+
+```bash
+curl http://localhost:10000/                # {"status":"ok"}
+curl http://localhost:10000/health          # {"ok":true,"status":"healthy"}
+```
+
+Telegram requires a **public HTTPS** URL to deliver updates, so for a full
+local end-to-end test expose your port with a tunnel and set `PUBLIC_URL` to it:
+
+```bash
+# Example using ngrok
+ngrok http 10000
+# Then set PUBLIC_URL=https://<your-id>.ngrok-free.app in .env and restart.
+```
+
+On startup the app validates config and registers the webhook automatically.
+If `BOT_TOKEN`, `WEBHOOK_SECRET`, or a public URL is missing/invalid, the app
+exits and prints exactly what to fix.
+
+---
+
+## 2. Test the webhook after Render deploy
+
+After the Render service is **Live**, replace `<TOKEN>` with your bot token:
+
+```bash
+curl "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"
+```
+
+A healthy response shows:
+- `"url"` ending in `/webhook/<your-secret>`
+- `"pending_update_count": 0` (or a small, draining number)
+- no `"last_error_message"`
+
+You can also use the built-in debug endpoint (only when `DEBUG=true`). It hides
+the secret and never shows the token:
+
+```bash
+curl "https://your-app.onrender.com/webhook-info"
+```
+
+Then test the bot in Telegram:
+1. Send `/start` → Arabic welcome message.
+2. Send a public link → two buttons: **تحميل فيديو** / **تحميل صوت MP3**.
+3. Tap a button → `⏳ جاري التحميل...` then the file.
+4. Tap again while it is still downloading → `يوجد تحميل قيد التنفيذ حالياً...`.
+
+---
+
+## 3. How to check logs
+
+**On Render:** open your service → **Logs** tab (live stream). Look for:
+- `Webhook registered at https://.../webhook/***` on startup (success).
+- `Invalid configuration — fix these environment variables:` (bad env vars).
+- `Telegram <method> failed: ...` or `... download failed: ...` (runtime issues).
+
+The bot token is never printed to logs.
+
+**Locally:** logs print to the terminal running uvicorn. Set `DEBUG=true` in
+`.env` to also enable the `/webhook-info` endpoint while debugging.
+
+---
+
+## 4. Test YouTube / TikTok / Instagram public links
+
+Send any of these **public** link shapes to the bot, then choose video or audio:
+
+| Platform   | Example link shape                                  |
+| ---------- | --------------------------------------------------- |
+| YouTube    | `https://www.youtube.com/watch?v=XXXXXXXXXXX`       |
+| YouTube    | `https://youtu.be/XXXXXXXXXXX`                       |
+| TikTok     | `https://www.tiktok.com/@user/video/0000000000`     |
+| TikTok     | `https://vm.tiktok.com/XXXXXXX/`                     |
+| Instagram  | `https://www.instagram.com/reel/XXXXXXXXXXX/`        |
+
+What to verify:
+- A **non-allowed** link (e.g. a plain website) → `❌ الرابط غير مدعوم.`
+- A short clip → video arrives via `sendVideo` (mp4) or `sendDocument`.
+- Audio button → an `.mp3` arrives via `sendAudio`.
+- A **large** file (> ~49 MB) → `⚠️ حجم الملف أكبر من الحد المسموح...` (not sent).
+- **Private / login-required** content → fails by design with the Arabic error
+  message. This bot does not bypass logins or restrictions.
+
+If a platform suddenly stops working, update `yt-dlp` by redeploying
+(Render → **Manual Deploy → Clear build cache & deploy**).

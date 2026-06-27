@@ -1,0 +1,18 @@
+# Render Blueprint — one-click Docker Web Service.
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: telegram-downloader-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # Set these in the Render dashboard (sync: false keeps them out of git).
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      # Non-secret; safe to commit. Set to "true" to enable /webhook-info.
+      - key: DEBUG
+        value: "false"
+      # PORT and RENDER_EXTERNAL_URL are provided by Render automatically.
