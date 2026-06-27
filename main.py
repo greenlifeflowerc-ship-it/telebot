@@ -3,22 +3,21 @@ Telegram video / audio downloader bot — webhook architecture for Render Web Se
 
 The user sends a public video URL (YouTube / TikTok / Instagram) and the bot
 replies with two inline buttons:
-    1. تحميل فيديو      -> choose a video quality, then download
+    1. تحميل فيديو      -> show ONLY the qualities that actually exist for the link
     2. تحميل صوت MP3     -> extract the audio and convert it to MP3
 
-Compatibility + speed:
-- FAST_MODE inspects the downloaded file with ffprobe and, when it is already a
-  Telegram/mobile-friendly MP4 (H.264 + AAC + yuv420p), does a fast stream-copy
-  remux (+faststart) instead of a slow full re-encode. Only incompatible files
-  are re-encoded.
-- LOW_RESOURCE_MODE keeps the bot stable on tiny instances (e.g. Render Free,
-  512 MB): disables Full/1080p, prefers 480p, caps height at 720p, serializes
-  media jobs, and uses lighter ffmpeg settings.
+Speed first:
+- Available qualities are read from the link's real yt-dlp formats; only those
+  buttons are shown. Per chat we store just a small {callback -> selector} map.
+- After download the file is inspected with ffprobe. A compatible MP4 is sent
+  directly (or fast-remuxed, never re-encoded). Heavy re-encoding is avoided by
+  default (NO_REENCODE_BY_DEFAULT); incompatible videos ask the user for a
+  lower quality instead.
+- The video is sent ONCE with sendVideo (never also as a document).
 
 This app is built for WEBHOOK deployment (NOT long polling), so it runs cleanly
 as a Render Web Service behind FastAPI + Uvicorn. The webhook handler returns to
-Telegram immediately and performs the slow download work in a background task so
-Telegram never times out.
+Telegram immediately and does the slow work in a background task.
 """
 
 from __future__ import annotations
@@ -56,30 +55,36 @@ except ImportError:  # pragma: no cover - optional dependency
 # Configuration
 # --------------------------------------------------------------------------- #
 
+def _flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET: str = os.environ.get("WEBHOOK_SECRET", "").strip()
 
-
-def _flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
-# Turns on the debug-only /webhook-info endpoint. Off unless explicitly enabled.
+# Debug-only /webhook-info endpoint.
 DEBUG: bool = _flag("DEBUG")
 
-# Low-memory mode for small instances (e.g. Render Free, 512 MB RAM). Disables
-# Full/1080p, prefers 480p, caps output height at 720p, lighter ffmpeg.
+# Low-memory mode for small instances (e.g. Render Free, 512 MB). Hides 1080p,
+# caps re-encode height at 720p, serializes media jobs.
 LOW_RESOURCE_MODE: bool = _flag("LOW_RESOURCE_MODE")
 
-# Fast mode: remux compatible MP4s instead of always re-encoding (big speed win
-# on slow CPUs). Re-encode happens only when the file is not compatible.
+# Fast mode: send a compatible MP4 directly (no ffmpeg) instead of remuxing.
 FAST_MODE: bool = _flag("FAST_MODE")
+
+# Never re-encode by default (the slow path). When True, incompatible videos are
+# refused with a "try a lower quality" message instead of being re-encoded.
+NO_REENCODE_BY_DEFAULT: bool = _flag("NO_REENCODE_BY_DEFAULT", default=True)
+
+# Optionally ALSO send the video as a document copy. Off by default — the bot
+# sends the video only once via sendVideo.
+SEND_VIDEO_AS_FILE_COPY: bool = _flag("SEND_VIDEO_AS_FILE_COPY")
 
 # Telegram Bot API practical upload limit for bots is 50 MB; stay just under it.
 MAX_FILE_SIZE: int = 49 * 1024 * 1024  # 49 MB in bytes
-
-# On a low-memory instance, warn the user before processing a clearly huge video.
-LOWRES_WARN_SIZE: int = 80 * 1024 * 1024  # 80 MB
 
 # Base URL for every Telegram Bot API call. The token lives here, so this value
 # (and any URL derived from it) must never be written to the logs.
@@ -100,37 +105,33 @@ _SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 # First http(s) link inside a text message.
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
-# Video quality keys -> label shown on the inline button. callback_data is the
-# key prefixed with "v_" (kept short for Telegram's callback length limit).
-QUALITY_LABELS: Dict[str, str] = {
-    "full": "الجودة الأصلية / Full",
-    "1080": "1080p",
-    "720": "720p",
-    "480": "480p",
-    "360": "360p",
-    "small": "أقل حجم / Small",
+# Standard heights we offer as buttons (high -> low), plus Small.
+STANDARD_HEIGHTS = (1080, 720, 480, 360, 240)
+
+# callback_data -> button label. callback_data is kept short on purpose.
+CALLBACK_LABELS: Dict[str, str] = {
+    "v_1080": "1080p",
+    "v_720": "720p",
+    "v_480": "480p",
+    "v_360": "360p",
+    "v_240": "240p",
+    "v_small": "أقل حجم / Small",
 }
-# Order the buttons are shown in (normal mode).
-QUALITY_ORDER: List[str] = ["full", "1080", "720", "480", "360", "small"]
-# Safe options when resolution detection is limited (some TikTok/Instagram links).
-FALLBACK_QUALITIES: List[str] = ["full", "720", "480", "small"]
-# Quality keys offered when LOW_RESOURCE_MODE is on (no Full / no 1080p).
-# 480p is listed first as the preferred/default choice for speed.
-LOWRES_QUALITIES: List[str] = ["480", "720", "360", "small"]
-# callback_data ("v_full" ...) -> quality key ("full" ...).
-VIDEO_QUALITY_ACTIONS: Dict[str, str] = {f"v_{key}": key for key in QUALITY_LABELS}
-# Target output height for the re-encode step (None = keep original resolution).
-QUALITY_TARGET_HEIGHTS: Dict[str, int] = {"1080": 1080, "720": 720, "480": 480, "360": 360}
+VIDEO_QUALITY_KEYS = tuple(CALLBACK_LABELS.keys())
+SMALL_SELECTOR = "worst[ext=mp4]/worst"
 
 # Prefix for every per-job temp folder; matched by the startup stale-folder sweep.
 TEMP_PREFIX = "tg_downloader_"
 
-# Per-chat memory of the last URL the user sent. In-memory only: cleared on
-# every restart / redeploy, which is fine for this simple flow.
+# Per-chat memory (in-memory only; cleared on restart):
+#   last_url_by_chat       -> the last URL the user sent
+#   last_selectors_by_chat -> SMALL map {callback -> yt-dlp format selector}
+# We deliberately never store the (large) yt-dlp info object.
 last_url_by_chat: Dict[int, str] = {}
+last_selectors_by_chat: Dict[int, Dict[str, str]] = {}
 
 # Concurrency state (guarded by _downloads_lock; downloads run in a threadpool):
-#   active_downloads  -> one active download per chat_id
+#   active_downloads   -> one active download per chat_id
 #   _global_job_active -> at most ONE media job server-wide (low-memory safety)
 active_downloads: set[int] = set()
 _global_job_active: bool = False
@@ -165,26 +166,20 @@ MSG_NO_URL = "أرسل الرابط أولًا، ثم اختر فيديو أو �
 MSG_DOWNLOADING = "⏳ جاري التحميل، قد يستغرق ذلك بعض الوقت..."
 MSG_BUSY = "يوجد تحميل قيد التنفيذ حالياً، انتظر حتى ينتهي."
 MSG_SERVER_BUSY = "السيرفر يعالج طلباً آخر حالياً، حاول بعد قليل."
-MSG_VIDEO_QUALITY_MENU = "اختر دقة الفيديو:"
-MSG_VIDEO_QUALITY_MENU_LOWRES = "اختر دقة الفيديو (يُفضّل 480p للسرعة على الخطة المجانية):"
+MSG_VIDEO_QUALITY_MENU = (
+    "اختر دقة الفيديو المتاحة:\n"
+    "(الأسرع هو اختيار 480p أو 360p بدون ضغط)"
+)
 MSG_720_SLOW = "قد يستغرق تحميل 720p وقتاً أطول على الخطة المجانية."
+MSG_NO_VIDEO = "لا يوجد فيديو متاح لهذا الرابط. جرّب رابطًا آخر أو تحميل الصوت MP3."
+MSG_FORMATS_UNREADABLE = "لم أستطع قراءة الدقات المتاحة، سأعرض خيارات آمنة للتجربة."
 MSG_PREPARING = "جاري تجهيز الفيديو..."
 MSG_SENDING_VIDEO = "جاري إرسال الفيديو..."
 MSG_COMPRESSING = "جاري ضغط الفيديو ليتوافق مع تلغرام..."
+MSG_NEEDS_CONVERSION = (
+    "هذا الفيديو يحتاج تحويل وقد يستغرق وقتاً طويلاً على الخطة المجانية. جرّب دقة أقل."
+)
 MSG_QUALITY_UNAVAILABLE = "هذه الدقة غير متاحة لهذا الرابط. جرّب دقة أخرى."
-MSG_FORMATS_UNREADABLE = "لم أستطع قراءة الدقات المتاحة، سأعرض خيارات آمنة للتجربة."
-MSG_MAYBE_TOO_LARGE = (
-    "⚠️ الحجم المتوقع كبير وقد يتجاوز حد تلغرام (حوالي 50 ميجابايت)، "
-    "سأحاول التحميل على أي حال."
-)
-MSG_LOWRES_BIG = (
-    "⚠️ هذا الفيديو كبير وقد لا تتحمله الخطة المجانية بسبب محدودية الرام. "
-    "جرّب دقة أقل مثل 480p."
-)
-MSG_FULL_BLOCKED_LOWRES = (
-    "الجودة الأصلية غير متاحة على الخطة المجانية بسبب محدودية الرام. "
-    "جرّب 720p أو 480p."
-)
 MSG_1080_BLOCKED_LOWRES = (
     "دقة 1080p غير متاحة على الخطة المجانية بسبب محدودية الرام. "
     "جرّب 720p أو 480p."
@@ -197,10 +192,7 @@ MSG_TOO_LARGE = (
     "⚠️ حجم الملف أكبر من الحد المسموح به في تيليجرام (حوالي 50 ميجابايت)، "
     "لذلك لا يمكن إرساله.\nجرّب فيديو أقصر أو جودة أقل."
 )
-MSG_TOO_LARGE_TRY_LOWER = (
-    "الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 720p أو 480p."
-)
-MSG_TOO_LARGE_LOWRES = (
+MSG_TOO_LARGE_VIDEO = (
     "الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 480p أو 360p."
 )
 MSG_AUDIO_NO_MP3 = "تم تحميل الصوت، لكن لم أستطع تحويله إلى MP3."
@@ -305,8 +297,6 @@ def public_base_url() -> str:
     1. PUBLIC_URL                      -> used as-is (override / non-Render / tunnels)
     2. RENDER_EXTERNAL_URL             -> used as-is (full URL, if Render provides it)
     3. https://{RENDER_EXTERNAL_HOSTNAME}  -> built from Render's default host var
-
-    Returns "" when none are set; validate_config() turns that into a clear error.
     """
     public_url = os.environ.get("PUBLIC_URL", "").strip()
     if public_url:
@@ -364,7 +354,6 @@ def register_webhook() -> None:
         "allowed_updates": ["message", "callback_query"],
         "drop_pending_updates": True,
     }
-    # Extra defense in depth: Telegram echoes this back in a request header.
     if _SECRET_TOKEN_RE.match(WEBHOOK_SECRET):
         payload["secret_token"] = WEBHOOK_SECRET
 
@@ -384,7 +373,6 @@ def extract_url(text: str) -> Optional[str]:
     match = _URL_RE.search(text or "")
     if not match:
         return None
-    # Trim trailing punctuation that often gets glued to a pasted link.
     return match.group(0).rstrip(").,!؛،")
 
 
@@ -414,12 +402,12 @@ def download_keyboard() -> dict:
     }
 
 
-def quality_keyboard(options: List[str]) -> dict:
-    """Build the quality inline keyboard (two buttons per row)."""
+def quality_keyboard(callback_keys: List[str]) -> dict:
+    """Build the quality inline keyboard (two buttons per row) from callback keys."""
     rows: List[List[dict]] = []
     row: List[dict] = []
-    for key in options:
-        row.append({"text": QUALITY_LABELS[key], "callback_data": f"v_{key}"})
+    for key in callback_keys:
+        row.append({"text": CALLBACK_LABELS.get(key, key), "callback_data": key})
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -429,99 +417,56 @@ def quality_keyboard(options: List[str]) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Quality detection + format selection
+# Quality detection (real formats) + format selectors
 # --------------------------------------------------------------------------- #
 
-def get_available_quality_options(url: str) -> Optional[List[str]]:
-    """Quality keys to offer for a URL (used only when LOW_RESOURCE_MODE is off).
+def _selector_for_height(height: int) -> str:
+    """yt-dlp selector for a height: prefer progressive mp4/H.264, then mp4
+    video + m4a audio, then any mp4, then any format <= height."""
+    return (
+        f"best[height<={height}][ext=mp4][vcodec^=avc1]/"
+        f"bestvideo[height<={height}][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+        f"best[height<={height}][ext=mp4]/"
+        f"best[height<={height}]"
+    )
 
-    Returns:
-        None  -> yt-dlp could not read the formats at all (caller shows a notice).
-        list  -> quality keys to show. May be the safe FALLBACK_QUALITIES when
-                 resolution info is limited (e.g. some TikTok/Instagram links).
-    """
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "skip_download": True,
-        "cachedir": False,
-        "retries": 2,
-        "socket_timeout": 30,
-    }
+
+def _selector_from_callback(callback: str) -> str:
+    """Fallback selector when no stored map exists (e.g. after a restart)."""
+    if callback == "v_small":
+        return SMALL_SELECTOR
+    return _selector_for_height(_height_from_key(callback))
+
+
+def _height_from_key(callback: str) -> int:
+    if callback == "v_small":
+        return 360
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as exc:  # noqa: BLE001 - any failure -> safe fallback path
-        logger.warning("Quality analysis failed: %s", exc)
-        return None
+        return int(callback.split("_")[1])
+    except (IndexError, ValueError):
+        return 720
 
-    if not info:
-        return None
 
-    heights = set()
-    for fmt in info.get("formats") or []:
-        height = fmt.get("height")
-        if height and fmt.get("vcodec") not in (None, "none"):
-            heights.add(int(height))
-    if not heights and info.get("height"):
-        heights.add(int(info["height"]))
-
-    if not heights:
-        return list(FALLBACK_QUALITIES)
-
-    max_height = max(heights)
-    options = ["full"]
-    for res in (1080, 720, 480, 360):
-        if max_height >= res or any(h >= res * 0.9 for h in heights):
-            options.append(str(res))
-    options.append("small")
+def _fallback_selectors() -> Dict[str, str]:
+    """Safe options when the link's formats can't be read."""
+    options: Dict[str, str] = {}
+    for height in (720, 480, 360):
+        options[f"v_{height}"] = _selector_for_height(height)
+    options["v_small"] = SMALL_SELECTOR
     return options
 
 
-def build_video_format_selector(quality: str) -> str:
-    """Map a quality key to a yt-dlp format selector string.
+def analyze_video_qualities(url: str) -> Optional[Dict[str, str]]:
+    """Inspect the link (download=False) and return ONLY the qualities that
+    actually exist as a small {callback -> selector} map.
 
-    Prefers mp4 / H.264 (avc1) formats before falling back, so the raw download
-    is already mobile-friendly when possible (then FAST_MODE can just remux).
-    """
-    selectors = {
-        "full": (
-            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "best[ext=mp4][vcodec^=avc1]/bestvideo+bestaudio/best"
-        ),
-        "1080": (
-            "bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "best[height<=1080][ext=mp4][vcodec^=avc1]/best[height<=1080]"
-        ),
-        "720": (
-            "bestvideo[height<=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "best[height<=720][ext=mp4]/best[height<=720]"
-        ),
-        "480": (
-            "bestvideo[height<=480][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "best[height<=480][ext=mp4]/best[height<=480]"
-        ),
-        "360": (
-            "bestvideo[height<=360][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "best[height<=360][ext=mp4]/best[height<=360]"
-        ),
-        "small": "worst[ext=mp4]/worst",
-    }
-    return selectors.get(quality, selectors["720"])
-
-
-def estimate_video_size(url: str, quality: str) -> Optional[int]:
-    """Best-effort estimated raw size (bytes) for the chosen quality, or None.
-
-    Uses filesize / filesize_approx from yt-dlp without downloading. The info
-    object is discarded immediately and never stored.
+    Returns None if formats can't be read at all, or {} if there is no video.
+    The large yt-dlp info object is never stored.
     """
     opts = {
-        "format": build_video_format_selector(quality),
-        "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "noplaylist": True,
         "skip_download": True,
         "cachedir": False,
         "retries": 2,
@@ -531,20 +476,35 @@ def estimate_video_size(url: str, quality: str) -> Optional[int]:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Size estimate failed: %s", exc)
+        logger.warning("Quality analysis failed: %s", exc)
         return None
     if not info:
         return None
 
-    requested = info.get("requested_formats")
-    if requested:  # merged video + audio
-        total = 0
-        for fmt in requested:
-            size = fmt.get("filesize") or fmt.get("filesize_approx")
-            if size:
-                total += size
-        return total or None
-    return info.get("filesize") or info.get("filesize_approx")
+    video_formats = [
+        f for f in (info.get("formats") or []) if f.get("vcodec") not in (None, "none")
+    ]
+    heights = sorted({int(f["height"]) for f in video_formats if f.get("height")})
+    if not heights and info.get("height"):
+        heights = [int(info["height"])]
+
+    has_video = bool(video_formats) or bool(heights) or bool(info.get("height"))
+    if not has_video:
+        return {}
+
+    options: Dict[str, str] = {}
+    if heights:
+        min_h, max_h = min(heights), max(heights)
+        for bucket in STANDARD_HEIGHTS:
+            if LOW_RESOURCE_MODE and bucket == 1080:
+                continue  # 1080p hidden on low-memory instances
+            # A bucket is "available" only when the source genuinely has it:
+            # at least one format <= bucket AND a format that reaches it.
+            if min_h <= bucket <= max_h:
+                options[f"v_{bucket}"] = _selector_for_height(bucket)
+    # Small is always offered when a video exists.
+    options["v_small"] = SMALL_SELECTOR
+    return options
 
 
 # --------------------------------------------------------------------------- #
@@ -552,12 +512,7 @@ def estimate_video_size(url: str, quality: str) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 
 def try_begin_download(chat_id: int) -> tuple[bool, Optional[str]]:
-    """Reserve the per-chat slot AND the single global job slot.
-
-    Returns (True, None) on success, or (False, arabic_reason) when this chat is
-    already downloading, or another media job is running anywhere on the server
-    (only one ffmpeg/yt-dlp job at a time keeps memory bounded on small hosts).
-    """
+    """Reserve the per-chat slot AND the single global job slot."""
     global _global_job_active
     with _downloads_lock:
         if chat_id in active_downloads:
@@ -581,12 +536,7 @@ def end_download(chat_id: int) -> None:
 # --------------------------------------------------------------------------- #
 
 def cleanup_workdir(workdir: str | Path, chat_id: int | None = None) -> None:
-    """Delete a job's temp folder and everything inside it.
-
-    Removes raw yt-dlp downloads, the remuxed/normalized MP4, the MP3 conversion,
-    thumbnails, fragments, and .part files — the whole folder. Safe to call more
-    than once and never raises.
-    """
+    """Delete a job's temp folder and everything inside it. Never raises."""
     shutil.rmtree(workdir, ignore_errors=True)
     if chat_id is not None:
         logger.info("Cleaned temp folder for chat_id=%s", chat_id)
@@ -595,11 +545,7 @@ def cleanup_workdir(workdir: str | Path, chat_id: int | None = None) -> None:
 
 
 def cleanup_stale_temp_dirs(max_age_seconds: int = 3600) -> None:
-    """Remove leftover ``tg_downloader_*`` folders older than ``max_age_seconds``.
-
-    Runs once on startup to clear anything a previous crash or restart may have
-    left in the system temp directory. Never raises.
-    """
+    """Remove leftover ``tg_downloader_*`` folders older than ``max_age_seconds``."""
     temp_root = tempfile.gettempdir()
     try:
         entries = os.listdir(temp_root)
@@ -633,7 +579,6 @@ def cleanup_stale_temp_dirs(max_age_seconds: int = 3600) -> None:
 def _base_ydl_opts(workdir: str) -> Dict[str, Any]:
     """Shared yt-dlp options: everything stays in workdir, low-resource friendly."""
     return {
-        # All output (and any fragments/.part files) stays inside workdir.
         "outtmpl": str(Path(workdir) / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "restrictfilenames": True,
@@ -658,10 +603,10 @@ def _largest_file(folder: str) -> Optional[str]:
     return max(candidates, key=os.path.getsize)
 
 
-def download_video(url: str, workdir: str, quality: str = "720") -> Optional[str]:
-    """Download the raw video into `workdir` using the selector for `quality`."""
+def download_video(url: str, workdir: str, selector: str) -> Optional[str]:
+    """Download the raw video into `workdir` using the given format selector."""
     opts = _base_ydl_opts(workdir)
-    opts["format"] = build_video_format_selector(quality)
+    opts["format"] = selector
     opts["merge_output_format"] = "mp4"
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
@@ -669,10 +614,7 @@ def download_video(url: str, workdir: str, quality: str = "720") -> Optional[str
 
 
 def probe_media(path: str) -> dict:
-    """Return ffprobe JSON (streams + format) for a media file, or {} on failure.
-
-    Uses small piped output (metadata only); only the tail of stderr is logged.
-    """
+    """Return ffprobe JSON (streams + format), or {} on failure (small output)."""
     cmd = [
         "ffprobe", "-v", "error", "-print_format", "json",
         "-show_streams", "-show_format", path,
@@ -698,45 +640,40 @@ def probe_media(path: str) -> dict:
         return {}
 
 
-def is_telegram_compatible(path: str) -> bool:
-    """True if `path` is already a Telegram/mobile-friendly MP4 (no re-encode).
-
-    Requires: .mp4 container, first video stream H.264 (avc1), pixel format
-    yuv420p (when reported), and any audio stream is AAC (no audio is fine).
-    """
-    if not path.lower().endswith(".mp4"):
-        return False
+def _probe_streams(path: str) -> Optional[dict]:
+    """Summarise a media file's container + codecs for the send decision."""
     info = probe_media(path)
     if not info:
-        return False
-
+        return None
     fmt = (info.get("format", {}).get("format_name") or "").lower()
-    if "mp4" not in fmt and "mov" not in fmt:
-        return False
-
+    is_mp4 = path.lower().endswith(".mp4") and ("mp4" in fmt or "mov" in fmt)
     streams = info.get("streams", [])
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
-    if not video:
-        return False
-    if (video.get("codec_name") or "").lower() not in ("h264", "avc1"):
-        return False
-    pix = (video.get("pix_fmt") or "").lower()
-    if pix and pix != "yuv420p":
-        return False
+    acodecs = [
+        (s.get("codec_name") or "").lower()
+        for s in streams if s.get("codec_type") == "audio"
+    ]
+    return {
+        "is_mp4": is_mp4,
+        "vcodec": (video.get("codec_name") or "").lower() if video else "",
+        "pix": (video.get("pix_fmt") or "").lower() if video else "",
+        "acodecs": acodecs,
+    }
 
-    for stream in streams:
-        if stream.get("codec_type") == "audio":
-            if (stream.get("codec_name") or "").lower() != "aac":
-                return False
-    return True
+
+def _is_compatible(streams: Optional[dict]) -> bool:
+    """True when streams are Telegram/mobile-friendly (H.264 + AAC/no-audio)."""
+    if not streams:
+        return False
+    if streams["vcodec"] not in ("h264", "avc1"):
+        return False
+    if streams["pix"] and streams["pix"] != "yuv420p":
+        return False
+    return all(a == "aac" for a in streams["acodecs"])  # empty -> True (no audio)
 
 
 def _run_ffmpeg(cmd: List[str], output_path: str) -> bool:
-    """Run an ffmpeg command. stderr -> a small log file (tail logged on error).
-
-    Avoids buffering large ffmpeg output in memory (no capture_output). Returns
-    True only when ffmpeg exits 0.
-    """
+    """Run ffmpeg with stderr -> a small log file (tail logged on error)."""
     log_path = output_path + ".log"
     try:
         with open(log_path, "wb") as errlog:
@@ -782,16 +719,10 @@ def normalize_video(
     input_path: str,
     output_path: str,
     target_height: Optional[int] = None,
-    crf: Optional[int] = None,
-    audio_bitrate: str = "128k",
+    crf: int = 30,
+    audio_bitrate: str = "96k",
 ) -> bool:
-    """Fallback path: re-encode to a Telegram/mobile-compatible MP4.
-
-    H.264 (libx264, profile main, yuv420p) + AAC, +faststart. Tuned for low
-    memory: single thread, ``ultrafast`` preset. Audio is optional (-map 0:a?)
-    so a video with no audio still produces a valid MP4. When target_height is
-    set the video is scaled down to it (never upscaled), keeping aspect ratio.
-    """
+    """Slow fallback: re-encode to H.264/AAC MP4 (only when explicitly allowed)."""
     cmd = [
         "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-threads", "1",
@@ -802,11 +733,7 @@ def normalize_video(
         cmd += ["-vf", f"scale=-2:min({target_height}\\,ih)"]
     cmd += [
         "-c:v", "libx264", "-preset", "ultrafast", "-profile:v", "main",
-        "-pix_fmt", "yuv420p",
-    ]
-    if crf is not None:
-        cmd += ["-crf", str(crf)]
-    cmd += [
+        "-pix_fmt", "yuv420p", "-crf", str(crf),
         "-c:a", "aac", "-b:a", audio_bitrate,
         "-movflags", "+faststart",
         output_path,
@@ -817,18 +744,14 @@ def normalize_video(
     return ok
 
 
-def _reencode_params(quality: str) -> tuple[Optional[int], Optional[int], str]:
-    """(target_height, crf, audio_bitrate) for the re-encode fallback."""
-    if FAST_MODE:
-        if quality == "small":
-            return 360, 32, "96k"
-        height = QUALITY_TARGET_HEIGHTS.get(quality) or 720
-        if LOW_RESOURCE_MODE:
-            height = min(height, 720)
-        return height, 30, "96k"
+def _reencode_params(quality_key: str) -> tuple[Optional[int], int, str]:
+    """(target_height, crf, audio_bitrate) for the optional re-encode fallback."""
+    if quality_key == "v_small":
+        return 360, 32, "96k"
+    height = _height_from_key(quality_key)
     if LOW_RESOURCE_MODE:
-        return min(QUALITY_TARGET_HEIGHTS.get(quality) or 720, 720), 28, "96k"
-    return QUALITY_TARGET_HEIGHTS.get(quality), None, "128k"
+        height = min(height, 720)
+    return height, 30, "96k"
 
 
 def _find_audio_file(folder: str) -> Optional[str]:
@@ -845,11 +768,7 @@ def _find_audio_file(folder: str) -> Optional[str]:
 
 
 def download_audio(url: str, workdir: str) -> Optional[str]:
-    """Download the best audio and convert to MP3 (192k) via ffmpeg.
-
-    Returns the resulting file path. If the MP3 conversion failed but a raw
-    audio file was produced, that path is returned instead (caller handles it).
-    """
+    """Download the best audio and convert to MP3 (192k) via ffmpeg."""
     opts = _base_ydl_opts(workdir)
     opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
     opts["postprocessors"] = [
@@ -872,48 +791,36 @@ def download_audio(url: str, workdir: str) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 
 def show_quality_menu(chat_id: int, url: str) -> None:
-    """Present the available quality options for a video link."""
-    if LOW_RESOURCE_MODE:
-        # Fixed, lighter menu — no Full/1080p, 480p preferred, no metadata call.
-        send_message(
-            chat_id,
-            MSG_VIDEO_QUALITY_MENU_LOWRES,
-            reply_markup=quality_keyboard(LOWRES_QUALITIES),
-        )
-        return
-
-    options = get_available_quality_options(url)
+    """Analyze the link and present ONLY the qualities that actually exist."""
+    options = analyze_video_qualities(url)
     if options is None:
         send_message(chat_id, MSG_FORMATS_UNREADABLE)
-        options = list(FALLBACK_QUALITIES)
+        options = _fallback_selectors()
+    if not options:
+        send_message(chat_id, MSG_NO_VIDEO)
+        return
+
+    # Store the small {callback -> selector} map for this chat (not the info obj).
+    last_selectors_by_chat[chat_id] = options
     send_message(
-        chat_id, MSG_VIDEO_QUALITY_MENU, reply_markup=quality_keyboard(options)
+        chat_id, MSG_VIDEO_QUALITY_MENU, reply_markup=quality_keyboard(list(options.keys()))
     )
 
 
-def handle_video_request(chat_id: int, url: str, quality: str) -> None:
+def handle_video_request(chat_id: int, url: str, quality_key: str, selector: str) -> None:
     workdir = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}{chat_id}_")
     try:
         logger.info(
-            "Video request: chat=%s quality=%s fast=%s low_res=%s",
-            chat_id, quality, FAST_MODE, LOW_RESOURCE_MODE,
+            "Video request: chat=%s quality=%s fast=%s low_res=%s no_reencode=%s",
+            chat_id, quality_key, FAST_MODE, LOW_RESOURCE_MODE, NO_REENCODE_BY_DEFAULT,
         )
-        if LOW_RESOURCE_MODE and quality == "720":
+        if LOW_RESOURCE_MODE and quality_key == "v_720":
             send_message(chat_id, MSG_720_SLOW)
 
-        # Best-effort pre-check: warn (but still proceed) on a large estimate.
-        estimate = estimate_video_size(url, quality)
-        if estimate:
-            logger.info("Pre-download estimate: %s", _mb(estimate))
-            if LOW_RESOURCE_MODE and estimate > LOWRES_WARN_SIZE:
-                send_message(chat_id, MSG_LOWRES_BIG)
-            elif estimate > MAX_FILE_SIZE:
-                send_message(chat_id, MSG_MAYBE_TOO_LARGE)
-
-        # 1) Download the raw file (inside workdir).
+        # 1) Download with the selected format selector.
         dl_start = time.monotonic()
         try:
-            raw_path = download_video(url, workdir, quality)
+            raw_path = download_video(url, workdir, selector)
         except DownloadError as exc:
             text = str(exc).lower()
             if "requested format" in text or "not available" in text or "no video" in text:
@@ -931,62 +838,64 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
             _mb(os.path.getsize(raw_path)),
         )
 
-        output_path = str(Path(workdir) / "normalized_output.mp4")
+        # 2) Inspect codecs/container with ffprobe.
+        probe_start = time.monotonic()
+        streams = _probe_streams(raw_path)
+        compatible = _is_compatible(streams)
+        logger.info(
+            "ffprobe inspect: %.2fs (compatible=%s, mp4=%s, v=%s, a=%s)",
+            time.monotonic() - probe_start, compatible,
+            streams["is_mp4"] if streams else "?",
+            streams["vcodec"] if streams else "?",
+            ",".join(streams["acodecs"]) if streams else "?",
+        )
 
-        # 2) FAST_MODE: inspect and remux when already compatible; otherwise
-        #    re-encode. When FAST_MODE is off we always re-encode (as before).
-        compatible = False
-        if FAST_MODE:
-            probe_start = time.monotonic()
-            compatible = is_telegram_compatible(raw_path)
-            logger.info(
-                "ffprobe inspect: %.2fs (compatible=%s)",
-                time.monotonic() - probe_start, compatible,
-            )
-
+        output_path = str(Path(workdir) / "video_output.mp4")
         proc_start = time.monotonic()
+
         if compatible:
             send_message(chat_id, MSG_SENDING_VIDEO)
-            method = "remux"
-            ok = remux_video(raw_path, output_path)
-            if not ok:
-                # Remux unexpectedly failed; fall back to a real re-encode.
-                logger.info("Remux failed; falling back to re-encode.")
-                send_message(chat_id, MSG_COMPRESSING)
-                method = "reencode"
-                th, crf, ab = _reencode_params(quality)
-                ok = normalize_video(raw_path, output_path, th, crf, ab)
+            if streams["is_mp4"] and FAST_MODE:
+                method = "direct"          # compatible MP4 -> send as-is (no ffmpeg)
+                final_path: Optional[str] = raw_path
+            else:
+                method = "remux"           # compatible streams -> fast remux to mp4
+                final_path = output_path if remux_video(raw_path, output_path) else None
+        elif NO_REENCODE_BY_DEFAULT:
+            # Heavy conversion would be needed; we don't re-encode by default.
+            logger.info("Incompatible and NO_REENCODE_BY_DEFAULT -> ask for lower quality.")
+            send_message(chat_id, MSG_NEEDS_CONVERSION)
+            return
         else:
-            send_message(chat_id, MSG_COMPRESSING)
             method = "reencode"
-            th, crf, ab = _reencode_params(quality)
-            ok = normalize_video(raw_path, output_path, th, crf, ab)
-        logger.info("%s: %.1fs", method, time.monotonic() - proc_start)
+            send_message(chat_id, MSG_COMPRESSING)
+            th, crf, ab = _reencode_params(quality_key)
+            final_path = output_path if normalize_video(raw_path, output_path, th, crf, ab) else None
 
-        if not ok or not os.path.exists(output_path):
+        if not final_path or not os.path.exists(final_path):
             send_message(chat_id, MSG_VIDEO_PROCESS_FAILED)
             return
-
-        final_size = os.path.getsize(output_path)
-        logger.info("Final file: %s (%s)", os.path.basename(output_path), _mb(final_size))
+        logger.info("%s done: %.1fs", method, time.monotonic() - proc_start)
 
         # 3) Enforce the Telegram size limit on the FINAL file.
+        final_size = os.path.getsize(final_path)
+        logger.info("Final file: %s (%s) method=%s", os.path.basename(final_path), _mb(final_size), method)
         if final_size > MAX_FILE_SIZE:
-            send_message(
-                chat_id,
-                MSG_TOO_LARGE_LOWRES if (LOW_RESOURCE_MODE or FAST_MODE) else MSG_TOO_LARGE_TRY_LOWER,
-            )
+            send_message(chat_id, MSG_TOO_LARGE_VIDEO)
             return
 
-        # 4) Send as a streamable video (deleted only after this returns/fails).
+        # 4) Send ONCE via sendVideo (a document copy only if explicitly enabled).
         up_start = time.monotonic()
-        sent = send_video(chat_id, output_path, caption=MSG_VIDEO_DONE)
+        sent = send_video(chat_id, final_path, caption=MSG_VIDEO_DONE)
         logger.info(
             "Telegram upload: %.1fs (%s, method=%s)",
             time.monotonic() - up_start, _mb(final_size), method,
         )
         if not sent:
             send_message(chat_id, MSG_ERROR)
+            return
+        if SEND_VIDEO_AS_FILE_COPY:
+            send_document(chat_id, final_path)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Video request failed: %s", exc)
         send_message(chat_id, MSG_ERROR)
@@ -1020,7 +929,6 @@ def handle_audio_request(chat_id: int, url: str) -> None:
                 logger.info("sendAudio failed; falling back to sendDocument")
                 send_document(chat_id, path)
         else:
-            # MP3 conversion didn't happen; send the raw audio as a document.
             logger.info("MP3 missing; sending raw audio via sendDocument")
             send_document(chat_id, path, caption=MSG_AUDIO_NO_MP3)
         logger.info("Telegram upload (audio): %.1fs (%s)", time.monotonic() - up_start, _mb(size))
@@ -1047,6 +955,7 @@ def handle_message(message: dict) -> None:
         return
 
     last_url_by_chat[chat_id] = url
+    last_selectors_by_chat.pop(chat_id, None)  # invalidate any old quality map
     send_message(chat_id, MSG_CHOOSE, reply_markup=download_keyboard())
 
 
@@ -1077,25 +986,21 @@ def handle_callback(callback: dict) -> None:
         send_message(chat_id, MSG_NO_URL)
         return
 
-    # Step 1: "تحميل فيديو" -> show the quality menu (no download yet).
+    # Step 1: "تحميل فيديو" -> analyze and show the available-qualities menu.
     if action == "dl_video":
         show_quality_menu(chat_id, url)
         return
 
     # Step 2: a concrete video quality -> guarded download.
-    if action in VIDEO_QUALITY_ACTIONS:
-        quality = VIDEO_QUALITY_ACTIONS[action]
-        # On low-memory instances, Full/1080p are not allowed.
-        if LOW_RESOURCE_MODE and quality == "full":
-            send_message(chat_id, MSG_FULL_BLOCKED_LOWRES)
-            return
-        if LOW_RESOURCE_MODE and quality == "1080":
+    if action in VIDEO_QUALITY_KEYS:
+        if LOW_RESOURCE_MODE and action == "v_1080":
             send_message(chat_id, MSG_1080_BLOCKED_LOWRES)
             return
+        selector = last_selectors_by_chat.get(chat_id, {}).get(action) or _selector_from_callback(action)
         _run_guarded_download(
             chat_id,
             MSG_PREPARING,
-            lambda: handle_video_request(chat_id, url, quality),
+            lambda: handle_video_request(chat_id, url, action, selector),
         )
         return
 
@@ -1127,13 +1032,12 @@ def process_update(update: dict) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Fail fast on bad config, sweep any old temp folders, then register.
     validate_config()
     cleanup_stale_temp_dirs()
-    if FAST_MODE:
-        logger.info("FAST_MODE is ON (remux when compatible, re-encode only as fallback).")
-    if LOW_RESOURCE_MODE:
-        logger.info("LOW_RESOURCE_MODE is ON (Full/1080p disabled, 480p preferred, 720p cap).")
+    logger.info(
+        "Flags: FAST_MODE=%s LOW_RESOURCE_MODE=%s NO_REENCODE_BY_DEFAULT=%s SEND_VIDEO_AS_FILE_COPY=%s",
+        FAST_MODE, LOW_RESOURCE_MODE, NO_REENCODE_BY_DEFAULT, SEND_VIDEO_AS_FILE_COPY,
+    )
     register_webhook()
     yield
 
@@ -1155,11 +1059,7 @@ def health() -> dict:
 
 @app.get("/webhook-info")
 def webhook_info() -> dict:
-    """Debug-only: return Telegram getWebhookInfo (enabled only when DEBUG=true).
-
-    The bot token is never part of this response; the webhook secret embedded in
-    the returned URL is masked before sending it back.
-    """
+    """Debug-only: return Telegram getWebhookInfo (enabled only when DEBUG=true)."""
     if not DEBUG:
         raise HTTPException(status_code=404, detail="not found")
     data = _api("getWebhookInfo")
@@ -1175,16 +1075,12 @@ def webhook_info() -> dict:
 async def telegram_webhook(
     secret: str, request: Request, background_tasks: BackgroundTasks
 ) -> dict:
-    # Gate 1: the secret embedded in the path must match.
     if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
-
-    # Gate 2: if Telegram sent the secret_token header, it must match too.
     header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if header_secret is not None and header_secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
 
     update = await request.json()
-    # Return to Telegram immediately; do the slow download work afterwards.
     background_tasks.add_task(process_update, update)
     return {"ok": True}

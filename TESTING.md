@@ -71,7 +71,7 @@ curl "https://your-app.onrender.com/webhook-info"
 Then test the bot in Telegram:
 1. Send `/start` → Arabic welcome message.
 2. Send a public link → two buttons: **تحميل فيديو** / **تحميل صوت MP3**.
-3. Tap **تحميل فيديو** → quality menu `اختر دقة الفيديو:` (see section 5).
+3. Tap **تحميل فيديو** → menu `اختر دقة الفيديو المتاحة:` (see section 5).
 4. Pick a quality → `جاري تجهيز الفيديو...`, then `جاري إرسال الفيديو...` (fast
    remux) or `جاري ضغط الفيديو ليتوافق مع تلغرام...` (re-encode), then the file.
 5. Tap **تحميل صوت MP3** → `⏳ جاري التحميل...` then an MP3.
@@ -123,25 +123,26 @@ If a platform suddenly stops working, update `yt-dlp` by redeploying
 
 ---
 
-## 5. Test video quality options
+## 5. Test video quality options (only available ones)
 
 1. Send a public link, then tap **تحميل فيديو**.
-2. The bot replies `اختر دقة الفيديو:` with a subset of:
-   **الجودة الأصلية / Full · 1080p · 720p · 480p · 360p · أقل حجم / Small**.
+2. The bot replies `اختر دقة الفيديو المتاحة:` (with the
+   `الأسرع هو اختيار 480p أو 360p بدون ضغط` note) and shows **only the
+   resolutions that exist** for that link — possible: 1080p · 720p · 480p ·
+   360p · 240p · أقل حجم (Small). There is **no Full/original button**.
 
 What to verify:
 
 | Action | Expected |
 | ------ | -------- |
-| Tap **الجودة الأصلية / Full** | Best quality, merged to mp4 (`bestvideo+bestaudio/best`). |
-| Tap **1080p / 720p / 480p / 360p** | Video capped at that height + best audio. |
+| Send a **YouTube** link | Menu shows the resolutions YouTube actually offers (e.g. 1080p/720p/480p/360p/240p/Small). No fake buttons. |
+| Send a **TikTok / Instagram** link | Only the resolution(s) that exist appear; often just **Small** (single-format sources). |
+| `LOW_RESOURCE_MODE=true` | **1080p never appears**, even if the link has it. |
+| Tap **480p** / **360p** | Downloads that resolution; logs show `method=direct` or `method=remux` (no re-encode). |
 | Tap **أقل حجم / Small** | Smallest file (`worst[ext=mp4]/worst`). |
-| Pick a resolution the link cannot provide | `هذه الدقة غير متاحة لهذا الرابط. جرّب دقة أخرى.` |
-| Send a **YouTube** link (rich formats) | Menu typically shows multiple resolutions. |
-| Send a **TikTok / Instagram** link (limited formats) | Falls back to **Full / 720p / 480p / Small**. |
-| Link whose formats can't be read | `لم أستطع قراءة الدقات المتاحة، سأعرض خيارات آمنة للتجربة.` then the safe menu. |
-| Large estimate before download | `⚠️ الحجم المتوقع كبير...` warning, but it still tries. |
-| Final file > 49 MB | `الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 720p أو 480p.` (not sent) — try 720p/480p. |
+| Link whose formats can't be read | `لم أستطع قراءة الدقات المتاحة...` then a safe fallback menu (720p/480p/360p/Small). |
+| Link with no video | `لا يوجد فيديو متاح لهذا الرابط...` |
+| Final file > 49 MB | `الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 480p أو 360p.` (not sent). |
 
 Tip: a long 4K/1080p YouTube video is an easy way to trigger the > 49 MB path;
 a short clip is an easy way to confirm a successful send.
@@ -231,45 +232,50 @@ touch -d '2 hours ago' "$(python -c 'import tempfile;print(tempfile.gettempdir()
 
 ## 8. Verify low-resource mode (Render Free 512 MB)
 
-Set `LOW_RESOURCE_MODE=true` (env var) and restart. The startup log shows
-`LOW_RESOURCE_MODE is ON (Full/1080p disabled, 480p preferred, 720p cap).`
+Set `LOW_RESOURCE_MODE=true` (env var) and restart. The startup log shows the
+flags line, e.g. `Flags: FAST_MODE=True LOW_RESOURCE_MODE=True ...`.
 
 What to verify:
-- Tap **تحميل فيديو** → the menu text recommends 480p and shows **only**
-  480p / 720p / 360p / أقل حجم (Small) — **480p first** — no Full, no 1080p.
+- Tap **تحميل فيديو** on a link that has 1080p → **1080p does not appear** in the
+  menu (other available resolutions still do).
 - Pick **720p** → first shows `قد يستغرق تحميل 720p وقتاً أطول على الخطة المجانية.`
-- If a `v_full` / `v_1080` callback is somehow sent (e.g. an old keyboard), the
-  bot replies `الجودة الأصلية غير متاحة على الخطة المجانية...` /
-  `دقة 1080p غير متاحة...`.
+- If a `v_1080` callback is somehow sent (e.g. an old keyboard), the bot replies
+  `دقة 1080p غير متاحة على الخطة المجانية...`.
 - **Global lock:** start a download in one chat, then immediately request one
   from a **different** chat → the second gets
   `السيرفر يعالج طلباً آخر حالياً، حاول بعد قليل.`
-- Pick **720p** on a 1080p source → the sent video is **≤ 720p** H.264/AAC.
 
-With `LOW_RESOURCE_MODE` unset/`false` (bigger instance), the full menu
-(Full / 1080p / 720p / 480p / 360p / Small) returns and no 720p cap is applied.
+With `LOW_RESOURCE_MODE` unset/`false` (bigger instance), 1080p appears whenever
+the link actually has it.
 
 ---
 
-## 9. Verify FAST_MODE (remux vs re-encode + timing)
+## 9. Verify speed (direct/remux, no re-encode by default)
 
-Set `FAST_MODE=true` and restart. Startup log shows
-`FAST_MODE is ON (remux when compatible, re-encode only as fallback).`
+Startup logs the flags, e.g.
+`Flags: FAST_MODE=True LOW_RESOURCE_MODE=True NO_REENCODE_BY_DEFAULT=True SEND_VIDEO_AS_FILE_COPY=False`.
 
-- **Compatible MP4 → fast remux.** A normal **YouTube** video (selectors prefer
-  H.264 mp4) should hit the remux path. Logs show
-  `ffprobe inspect: ...s (compatible=True)` then `remux: 0.Xs` and
-  `method=remux` on the upload line — processing is near-instant.
-- **Incompatible format → re-encode fallback.** A source that only offers
-  **VP9/AV1/WebM** shows `compatible=False`, the bot sends
-  `جاري ضغط الفيديو ليتوافق مع تلغرام...`, and the log shows
-  `ffmpeg re-encode ok (height=... crf=30)` (or `crf=32` for Small).
-- **Compare timings.** Remux is typically well under a second; a full re-encode
-  on Render Free can take many seconds to minutes. Watch the
-  `yt-dlp download` / `ffprobe inspect` / `remux`|`reencode` / `Telegram upload`
-  lines to see where time goes.
-- **Result is still compatible** either way: the received video plays with image
-  + sound and saves to the gallery.
+- **Choose 480p on a YouTube link → no heavy re-encode.** The logs should show
+  `compatible=True` and `method=direct` (FAST_MODE) or `method=remux` — **never**
+  `ffmpeg re-encode ok`. Processing time is ~0s (direct) or a fraction of a
+  second (remux):
+  ```
+  yt-dlp download: 5.1s -> <id>.mp4 (6.0 MB)
+  ffprobe inspect: 0.05s (compatible=True, mp4=True, v=h264, a=aac)
+  direct done: 0.0s
+  Telegram upload: 1.8s (6.0 MB, method=direct)
+  ```
+- **sendVideo only — never sendDocument.** The video arrives as an inline,
+  playable video, **not** a file attachment. With `SEND_VIDEO_AS_FILE_COPY=false`
+  (default) there is exactly one upload; the logs show a single
+  `Telegram upload` line for the video and no `sendDocument`.
+- **Incompatible source with `NO_REENCODE_BY_DEFAULT=true`.** A VP9/AV1-only link
+  shows `compatible=False` and the bot replies
+  `هذا الفيديو يحتاج تحويل وقد يستغرق وقتاً طويلاً على الخطة المجانية. جرّب دقة أقل.`
+  — it does **not** spend minutes re-encoding.
+- **Optional re-encode fallback.** Only with `NO_REENCODE_BY_DEFAULT=false` does
+  an incompatible source get `جاري ضغط الفيديو...` and
+  `ffmpeg re-encode ok (height=... crf=30)`.
 
-With `FAST_MODE` unset/`false`, every video is re-encoded (slower) regardless of
-its codecs — useful to compare timings against remux.
+`FAST_MODE=false` swaps direct-send for a fast remux (still no re-encode) — handy
+to compare `method=direct` vs `method=remux` timings.

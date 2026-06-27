@@ -75,8 +75,10 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 | `WEBHOOK_SECRET`      | ✅ Yes   | Secret used in the webhook path and `secret_token` header.                  |
 | `PUBLIC_URL`              | Optional | Public HTTPS base URL. Only needed **outside Render**, or if automatic hostname detection fails. Used as-is when set. |
 | `DEBUG`                   | Optional | `true` enables the debug-only `/webhook-info` endpoint. Default off.         |
-| `LOW_RESOURCE_MODE`       | Optional | `true` for small instances (Render Free 512 MB): disables Full/1080p, prefers 480p, caps 720p, serializes jobs, lighter ffmpeg. |
-| `FAST_MODE`               | Optional | `true` to remux compatible MP4s (instant) and re-encode only when needed — big speed win on slow CPUs. |
+| `LOW_RESOURCE_MODE`       | Optional | `true` for small instances (Render Free 512 MB): hides 1080p, caps re-encode at 720p, serializes jobs. |
+| `FAST_MODE`               | Optional | `true` sends a compatible MP4 directly (no ffmpeg); `false` fast-remuxes it. Big speed win on slow CPUs. |
+| `NO_REENCODE_BY_DEFAULT`  | Optional | **Default `true`.** Never re-encode; incompatible videos ask for a lower quality instead of the slow re-encode. |
+| `SEND_VIDEO_AS_FILE_COPY` | Optional | Default `false`. Keep `false` — the bot sends each video only once via `sendVideo`. |
 | `RENDER_EXTERNAL_URL`     | Auto     | Injected by Render (when available) — **do not set manually**.              |
 | `RENDER_EXTERNAL_HOSTNAME`| Auto     | Render's standard host var — the app builds `https://{hostname}` from it. **Do not set manually**. |
 | `PORT`                    | Auto     | Injected by Render automatically — the app binds to it.                     |
@@ -170,9 +172,9 @@ Then test the bot itself:
    You should get the Arabic welcome message.
 2. Send a public link, e.g. a YouTube URL.
    The bot replies with **تحميل فيديو** / **تحميل صوت MP3** buttons.
-3. Tap **تحميل فيديو** → a quality menu (`اختر دقة الفيديو:`) appears; pick a
-   resolution and the bot downloads and sends the file. Tap **تحميل صوت MP3**
-   for an MP3 instead.
+3. Tap **تحميل فيديو** → a menu of the **available** resolutions
+   (`اختر دقة الفيديو المتاحة:`) appears; pick one and the bot sends the file.
+   Tap **تحميل صوت MP3** for an MP3 instead.
 
 ### Service endpoints
 
@@ -223,134 +225,129 @@ Render) pulls the latest version. If downloads suddenly start failing, redeploy.
 
 ---
 
-## 🎚️ Video quality selection
+## 🎚️ Video quality selection (only what's available)
 
-Tapping **تحميل فيديو** no longer downloads immediately. The bot first inspects
-the link with `yt-dlp` (metadata only, `download=False`) and shows the
-resolutions that link can actually provide:
+Tapping **تحميل فيديو** does **not** download immediately. The bot inspects the
+link with `yt-dlp` (`download=False`), reads the **real** formats, and shows
+**only the resolutions that actually exist** for that link:
 
-| Button (Arabic / label)   | Behaviour                                                       |
-| ------------------------- | -------------------------------------------------------------- |
-| الجودة الأصلية / Full     | Best available — `bestvideo+bestaudio/best`, merged to mp4.     |
-| 1080p                     | Best video up to 1080p + best audio.                           |
-| 720p                      | Best video up to 720p + best audio.                            |
-| 480p                      | Best video up to 480p + best audio.                            |
-| 360p                      | Best video up to 360p + best audio.                            |
-| أقل حجم / Small           | Smallest file — `worst[ext=mp4]/worst`.                        |
+```
+اختر دقة الفيديو المتاحة:
+(الأسرع هو اختيار 480p أو 360p بدون ضغط)
+```
 
-- A resolution button is shown **only** when that height (or a close lower
-  format) is likely available.
-- If resolution detection is limited (common on some **TikTok / Instagram**
-  links), the bot falls back to a safe set: **Full / 720p / 480p / Small**.
-- If `yt-dlp` cannot read formats at all, it says so in Arabic and still offers
-  the safe set so you can try.
-- Callback data is kept short (`v_full`, `v_1080`, `v_720`, `v_480`, `v_360`,
-  `v_small`, `audio`) to stay within Telegram's callback-length limit.
-- The 49 MB guard still applies: if the estimate looks large it warns first but
-  still tries; if the **final** file exceeds 49 MB it is not sent and the bot
-  replies `الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 720p أو 480p.`
-- The **audio (MP3)** flow is unchanged. One active download per chat still
-  applies, and large `yt-dlp` info objects are never stored in memory.
+- Possible buttons: **1080p · 720p · 480p · 360p · 240p · أقل حجم (Small)**. Each
+  resolution appears **only if the source genuinely has it** (a button is shown
+  only when there is a format `≤` that height *and* the source reaches it). No
+  fake buttons, and there is no "Full/original" button.
+- **Small** is always shown when any video exists (`worst[ext=mp4]/worst`).
+- **1080p is hidden** when `LOW_RESOURCE_MODE=true`.
+- If the formats can't be read (some TikTok/Instagram links), the bot says so in
+  Arabic and offers a safe fallback set (720p / 480p / 360p / Small).
+- Selectors prefer **progressive MP4 / H.264 (avc1)** with audio, then MP4 video
+  + M4A audio, so most downloads come back already compatible.
+- Callback data stays short: `v_1080`, `v_720`, `v_480`, `v_360`, `v_240`,
+  `v_small`, `audio`.
+- **Memory:** only a tiny per-chat map `{callback → selector}` is stored — never
+  the large `yt-dlp` info object.
+- The 49 MB guard still applies; if the final file is too large the bot replies
+  `الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 480p أو 360p.`
 
-The two helpers driving this are `get_available_quality_options(url)` and
-`build_video_format_selector(quality)` in [main.py](main.py).
-
----
-
-## 📱 Mobile / Telegram compatibility (normalization)
-
-Some sources hand back codecs/containers that the Telegram player and phone
-galleries handle poorly — **VP9 / AV1 / WebM**, 10-bit pixel formats, or badly
-muxed MP4. That is what caused frozen-image-but-audio-plays videos and clips
-that didn't appear correctly in the gallery after saving.
-
-To fix this, **every video is re-encoded with ffmpeg before sending**, even when
-yt-dlp already produced an mp4:
-
-- Container **`.mp4`**, video **H.264 (libx264, profile main)**, audio **AAC 128k**
-- Pixel format **`yuv420p`** and **`-movflags +faststart`** (instant playback / streaming)
-- Selected height kept for **1080p/720p/480p/360p** (scaled down only, never upscaled);
-  **Full** keeps the original resolution; a video with no audio still yields a valid MP4
-- Format selection now **prefers mp4 / H.264 (`avc1`)** before falling back, so the
-  raw file is already friendly when possible
-- The raw yt-dlp file is **never sent directly**; if normalization fails the bot
-  replies in Arabic instead of sending a broken video
-- The final, normalized file is checked against the **49 MB** limit and sent with
-  `sendVideo` (`supports_streaming=true`, `video/mp4`)
-
-If **Full** quality is too large for Telegram, pick **720p** or **480p**. Long or
-high-quality videos can still exceed the 49 MB bot limit even after normalization.
+The helpers driving this are `analyze_video_qualities(url)` and
+`_selector_for_height(h)` in [main.py](main.py).
 
 ---
 
-## ⚡ Fast mode (remux instead of re-encode)
+## 📱 Mobile / Telegram compatibility
 
-Full ffmpeg re-encoding is CPU-heavy and **slow on Render Free**. With
-**`FAST_MODE=true`** the bot avoids it whenever possible:
+Some sources hand back codecs the Telegram player and phone galleries handle
+poorly — **VP9 / AV1 / WebM**, 10-bit pixel formats. The bot keeps videos
+compatible **without** paying for a full re-encode on every download:
 
-1. After yt-dlp downloads the file, it is inspected with **ffprobe**.
-2. If it is **already Telegram/mobile-compatible** — `.mp4` container, **H.264
-   (avc1)** video, **AAC** (or no) audio, **yuv420p** — the bot does a fast
-   **stream-copy remux** only (no re-encode):
-   `ffmpeg -i in -c copy -movflags +faststart out.mp4` (near-instant).
-3. If it is **not** compatible, it re-encodes as a fallback
-   (`libx264 -preset ultrafast -crf 30 -pix_fmt yuv420p -c:a aac -b:a 96k`;
-   **Small** uses 360p / CRF 32).
+- Selectors prefer **progressive MP4 / H.264 (avc1) + AAC**, so most downloads
+  are already compatible.
+- A compatible file is **sent directly** (FAST_MODE) or **fast-remuxed**
+  (`-c copy -movflags +faststart`) — never re-encoded.
+- An **incompatible** file is **not** re-encoded by default (`NO_REENCODE_BY_DEFAULT`):
+  the bot asks for a lower quality instead, keeping Render Free fast and stable.
+- If you set `NO_REENCODE_BY_DEFAULT=false`, the slow fallback re-encodes to
+  H.264/AAC/`yuv420p` MP4 (`-preset ultrafast`, CRF 30; Small → 360p/CRF 32).
+- Either way the file is checked against the **49 MB** limit and sent **once**
+  with `sendVideo` — never also as a document.
 
-Because the format selectors already prefer mp4/H.264, most YouTube downloads hit
-the instant remux path. You'll see the chosen path in the timing logs:
+Long or high-quality videos can still exceed 49 MB — pick **480p** or **360p**.
+
+---
+
+## ⚡ Speed: no compression by default
+
+Full ffmpeg re-encoding is CPU-heavy and **slow on Render Free**, so the bot
+**avoids it by default**. After download it inspects the file with **ffprobe**
+and picks the fastest safe path:
+
+1. **Compatible MP4** (`.mp4`, **H.264/avc1**, **AAC** or no audio, **yuv420p**):
+   - `FAST_MODE=true` → **send directly** with no ffmpeg at all (fastest).
+   - `FAST_MODE=false` → a fast **stream-copy remux**
+     (`ffmpeg -i in -c copy -movflags +faststart out.mp4`, near-instant).
+2. **Compatible streams in a non-MP4 container** → fast remux to MP4.
+3. **Incompatible** (VP9 / AV1 / etc.) with **`NO_REENCODE_BY_DEFAULT=true`**
+   (the default) → the bot does **not** compress; it replies
+   `هذا الفيديو يحتاج تحويل وقد يستغرق وقتاً طويلاً على الخطة المجانية. جرّب دقة أقل.`
+   Only when `NO_REENCODE_BY_DEFAULT=false` does it re-encode as a slow fallback.
+
+Because the selectors prefer progressive MP4 / H.264, most YouTube links hit the
+instant direct/remux path. The chosen path shows in the timing logs:
 
 ```
 yt-dlp download: 6.4s -> <title>-<id>.mp4 (8.1 MB)
-ffprobe inspect: 0.05s (compatible=True)
-remux: 0.3s
-Telegram upload: 2.1s (8.1 MB, method=remux)
+ffprobe inspect: 0.05s (compatible=True, mp4=True, v=h264, a=aac)
+direct done: 0.0s
+Telegram upload: 2.1s (8.1 MB, method=direct)
 ```
 
-**Render Free is slow for video conversion.** Prefer **480p** or **360p** there;
-they download, process, and upload fastest and stay well under the 49 MB limit.
+The video is sent **once** via `sendVideo` (`supports_streaming=true`,
+`video/mp4`, caption `تم تحميل الفيديو.`) — never also as a document.
 
-User-facing flow (Arabic): `جاري تجهيز الفيديو...` → then either
-`جاري إرسال الفيديو...` (remux) or `جاري ضغط الفيديو ليتوافق مع تلغرام...`
-(re-encode). Choosing 720p on a free plan also shows
+**Render Free is slow for video conversion.** Prefer **480p** or **360p** there;
+they download and upload fastest and stay well under the 49 MB limit.
+
+User-facing flow (Arabic): `جاري تجهيز الفيديو...` → `جاري إرسال الفيديو...`
+(direct/remux) or `جاري ضغط الفيديو ليتوافق مع تلغرام...` (only if re-encode is
+enabled). Choosing 720p in low-resource mode also shows
 `قد يستغرق تحميل 720p وقتاً أطول على الخطة المجانية.`
 
 ---
 
 ## 🪫 Low-resource mode (Render Free 512 MB)
 
-ffmpeg re-encoding is memory-hungry; on a 512 MB instance, **Full/original** and
-**1080p** can crash the worker (out-of-memory). Set **`LOW_RESOURCE_MODE=true`**
-(it is the default in `.env.example`) to keep the bot stable:
+On a 512 MB instance, heavy ffmpeg work can crash the worker. The bot already
+avoids re-encoding by default; **`LOW_RESOURCE_MODE=true`** adds extra guards:
 
-- **Quality menu shows only** 480p / 720p / 360p / أقل حجم (Small) — plus the
-  MP3 button. **480p is the preferred/default** (shown first, recommended in the
-  menu text). Full/1080p are hidden, and if one is somehow requested the bot
-  replies in Arabic suggesting 720p/480p.
-- **Output height is capped at 720p** (downscale only, never upscaled).
+- **1080p is hidden** from the quality menu. If a `v_1080` callback is somehow
+  received, the bot replies suggesting 720p/480p.
 - **One media job at a time, server-wide.** A second user gets
   `السيرفر يعالج طلباً آخر حالياً، حاول بعد قليل.` until the current job finishes
   (the per-chat lock still applies too).
-- **Lighter ffmpeg:** single thread, `-preset ultrafast`, `-crf 28`, AAC 96k,
-  `-loglevel error` with stderr written to a small log file (not buffered in RAM).
+- Choosing **720p** shows `قد يستغرق تحميل 720p وقتاً أطول على الخطة المجانية.`
+- If a re-encode ever runs (`NO_REENCODE_BY_DEFAULT=false`), its height is
+  **capped at 720p**, single-thread, `-preset ultrafast`.
 - **yt-dlp** runs with `cachedir=False`, `retries=2`, `socket_timeout=30`, and
-  `concurrent_fragment_downloads=1`.
-- If the estimated size is very large (> 80 MB) it warns and suggests 480p; if the
-  final file still exceeds 49 MB it is not sent and suggests 480p/360p.
+  `concurrent_fragment_downloads=1`. The video is sent once via `sendVideo`.
 
 The Docker image already starts uvicorn with a single worker and a small
 concurrency cap (`--workers 1 --limit-concurrency 4`) to bound memory.
 
-### Want Full / original or 1080p?
+### Want 1080p (and incompatible-source support)?
 
-Run on something with more RAM and leave `LOW_RESOURCE_MODE` unset/`false`:
+Run on something with more RAM and leave `LOW_RESOURCE_MODE` unset/`false` (and
+optionally `NO_REENCODE_BY_DEFAULT=false` to allow the re-encode fallback):
 
 - A small VPS such as **Oracle Cloud Always Free (Ampere A1)** — generous free
   RAM/CPU, good for heavier encoding.
 - A **paid Render instance** (more RAM, always-on).
 
-On those, the full quality menu (Full / 1080p / 720p / 480p / 360p / Small) is
-available again.
+There, 1080p shows whenever the link has it, and incompatible sources can be
+re-encoded instead of refused.
 
 ---
 
