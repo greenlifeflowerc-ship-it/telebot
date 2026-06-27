@@ -75,7 +75,8 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 | `WEBHOOK_SECRET`      | ✅ Yes   | Secret used in the webhook path and `secret_token` header.                  |
 | `PUBLIC_URL`              | Optional | Public HTTPS base URL. Only needed **outside Render**, or if automatic hostname detection fails. Used as-is when set. |
 | `DEBUG`                   | Optional | `true` enables the debug-only `/webhook-info` endpoint. Default off.         |
-| `LOW_RESOURCE_MODE`       | Optional | `true` for small instances (Render Free 512 MB): disables Full/1080p, caps 720p, serializes jobs, lighter ffmpeg. |
+| `LOW_RESOURCE_MODE`       | Optional | `true` for small instances (Render Free 512 MB): disables Full/1080p, prefers 480p, caps 720p, serializes jobs, lighter ffmpeg. |
+| `FAST_MODE`               | Optional | `true` to remux compatible MP4s (instant) and re-encode only when needed — big speed win on slow CPUs. |
 | `RENDER_EXTERNAL_URL`     | Auto     | Injected by Render (when available) — **do not set manually**.              |
 | `RENDER_EXTERNAL_HOSTNAME`| Auto     | Render's standard host var — the app builds `https://{hostname}` from it. **Do not set manually**. |
 | `PORT`                    | Auto     | Injected by Render automatically — the app binds to it.                     |
@@ -282,14 +283,49 @@ high-quality videos can still exceed the 49 MB bot limit even after normalizatio
 
 ---
 
+## ⚡ Fast mode (remux instead of re-encode)
+
+Full ffmpeg re-encoding is CPU-heavy and **slow on Render Free**. With
+**`FAST_MODE=true`** the bot avoids it whenever possible:
+
+1. After yt-dlp downloads the file, it is inspected with **ffprobe**.
+2. If it is **already Telegram/mobile-compatible** — `.mp4` container, **H.264
+   (avc1)** video, **AAC** (or no) audio, **yuv420p** — the bot does a fast
+   **stream-copy remux** only (no re-encode):
+   `ffmpeg -i in -c copy -movflags +faststart out.mp4` (near-instant).
+3. If it is **not** compatible, it re-encodes as a fallback
+   (`libx264 -preset ultrafast -crf 30 -pix_fmt yuv420p -c:a aac -b:a 96k`;
+   **Small** uses 360p / CRF 32).
+
+Because the format selectors already prefer mp4/H.264, most YouTube downloads hit
+the instant remux path. You'll see the chosen path in the timing logs:
+
+```
+yt-dlp download: 6.4s -> <title>-<id>.mp4 (8.1 MB)
+ffprobe inspect: 0.05s (compatible=True)
+remux: 0.3s
+Telegram upload: 2.1s (8.1 MB, method=remux)
+```
+
+**Render Free is slow for video conversion.** Prefer **480p** or **360p** there;
+they download, process, and upload fastest and stay well under the 49 MB limit.
+
+User-facing flow (Arabic): `جاري تجهيز الفيديو...` → then either
+`جاري إرسال الفيديو...` (remux) or `جاري ضغط الفيديو ليتوافق مع تلغرام...`
+(re-encode). Choosing 720p on a free plan also shows
+`قد يستغرق تحميل 720p وقتاً أطول على الخطة المجانية.`
+
+---
+
 ## 🪫 Low-resource mode (Render Free 512 MB)
 
 ffmpeg re-encoding is memory-hungry; on a 512 MB instance, **Full/original** and
 **1080p** can crash the worker (out-of-memory). Set **`LOW_RESOURCE_MODE=true`**
 (it is the default in `.env.example`) to keep the bot stable:
 
-- **Quality menu shows only** 720p / 480p / 360p / أقل حجم (Small) — plus the
-  MP3 button. Full/1080p are hidden, and if one is somehow requested the bot
+- **Quality menu shows only** 480p / 720p / 360p / أقل حجم (Small) — plus the
+  MP3 button. **480p is the preferred/default** (shown first, recommended in the
+  menu text). Full/1080p are hidden, and if one is somehow requested the bot
   replies in Arabic suggesting 720p/480p.
 - **Output height is capped at 720p** (downscale only, never upscaled).
 - **One media job at a time, server-wide.** A second user gets

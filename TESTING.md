@@ -72,7 +72,8 @@ Then test the bot in Telegram:
 1. Send `/start` → Arabic welcome message.
 2. Send a public link → two buttons: **تحميل فيديو** / **تحميل صوت MP3**.
 3. Tap **تحميل فيديو** → quality menu `اختر دقة الفيديو:` (see section 5).
-4. Pick a quality → `جاري تحميل الفيديو بالدقة المختارة...` then the file.
+4. Pick a quality → `جاري تجهيز الفيديو...`, then `جاري إرسال الفيديو...` (fast
+   remux) or `جاري ضغط الفيديو ليتوافق مع تلغرام...` (re-encode), then the file.
 5. Tap **تحميل صوت MP3** → `⏳ جاري التحميل...` then an MP3.
 6. Tap again while a download is running → `يوجد تحميل قيد التنفيذ حالياً...`.
 
@@ -162,17 +163,19 @@ Check the Render logs for the diagnostic trail of one video request (no secrets
 are logged):
 
 ```
-Video request: chat=... quality=720
-Raw download: <title>-<id>.webm (12.3 MB)
-ffmpeg normalization ok (target_height=720)
-Normalized: normalized_output.mp4 (9.8 MB)
-Sending via sendVideo
+Video request: chat=... quality=720 fast=True low_res=True
+yt-dlp download: 6.4s -> <title>-<id>.mp4 (8.1 MB)
+ffprobe inspect: 0.05s (compatible=True)
+remux: 0.3s
+Final file: normalized_output.mp4 (8.1 MB)
+Telegram upload: 2.1s (8.1 MB, method=remux)
 Cleaned temp folder for chat_id=...
 ```
 
-If normalization itself fails, you get `تعذّرت معالجة الفيديو لجعله متوافقًا مع
-تيليجرام...` instead of a broken video. Confirm ffmpeg is installed — it is
-provided by the Docker image, so this should only happen on a broken/odd source.
+If processing fails, you get `تعذّرت معالجة الفيديو لجعله متوافقًا مع
+تيليجرام...` instead of a broken video. Confirm ffmpeg/ffprobe are installed —
+they are provided by the Docker image, so this should only happen on a broken
+source.
 
 > Local note: re-encoding needs **ffmpeg on your PATH** when running without
 > Docker. On Render it is already in the image.
@@ -229,11 +232,12 @@ touch -d '2 hours ago' "$(python -c 'import tempfile;print(tempfile.gettempdir()
 ## 8. Verify low-resource mode (Render Free 512 MB)
 
 Set `LOW_RESOURCE_MODE=true` (env var) and restart. The startup log shows
-`LOW_RESOURCE_MODE is ON (Full/1080p disabled, 720p cap).`
+`LOW_RESOURCE_MODE is ON (Full/1080p disabled, 480p preferred, 720p cap).`
 
 What to verify:
-- Tap **تحميل فيديو** → the quality menu shows **only** 720p / 480p / 360p /
-  أقل حجم (Small) — no Full, no 1080p.
+- Tap **تحميل فيديو** → the menu text recommends 480p and shows **only**
+  480p / 720p / 360p / أقل حجم (Small) — **480p first** — no Full, no 1080p.
+- Pick **720p** → first shows `قد يستغرق تحميل 720p وقتاً أطول على الخطة المجانية.`
 - If a `v_full` / `v_1080` callback is somehow sent (e.g. an old keyboard), the
   bot replies `الجودة الأصلية غير متاحة على الخطة المجانية...` /
   `دقة 1080p غير متاحة...`.
@@ -241,9 +245,31 @@ What to verify:
   from a **different** chat → the second gets
   `السيرفر يعالج طلباً آخر حالياً، حاول بعد قليل.`
 - Pick **720p** on a 1080p source → the sent video is **≤ 720p** H.264/AAC.
-- Logs show the lighter pipeline, e.g.
-  `ffmpeg normalization ok (height=720 crf=28)` and
-  `Video request: chat=... quality=720 low_res=True`.
 
 With `LOW_RESOURCE_MODE` unset/`false` (bigger instance), the full menu
 (Full / 1080p / 720p / 480p / 360p / Small) returns and no 720p cap is applied.
+
+---
+
+## 9. Verify FAST_MODE (remux vs re-encode + timing)
+
+Set `FAST_MODE=true` and restart. Startup log shows
+`FAST_MODE is ON (remux when compatible, re-encode only as fallback).`
+
+- **Compatible MP4 → fast remux.** A normal **YouTube** video (selectors prefer
+  H.264 mp4) should hit the remux path. Logs show
+  `ffprobe inspect: ...s (compatible=True)` then `remux: 0.Xs` and
+  `method=remux` on the upload line — processing is near-instant.
+- **Incompatible format → re-encode fallback.** A source that only offers
+  **VP9/AV1/WebM** shows `compatible=False`, the bot sends
+  `جاري ضغط الفيديو ليتوافق مع تلغرام...`, and the log shows
+  `ffmpeg re-encode ok (height=... crf=30)` (or `crf=32` for Small).
+- **Compare timings.** Remux is typically well under a second; a full re-encode
+  on Render Free can take many seconds to minutes. Watch the
+  `yt-dlp download` / `ffprobe inspect` / `remux`|`reencode` / `Telegram upload`
+  lines to see where time goes.
+- **Result is still compatible** either way: the received video plays with image
+  + sound and saves to the gallery.
+
+With `FAST_MODE` unset/`false`, every video is re-encoded (slower) regardless of
+its codecs — useful to compare timings against remux.

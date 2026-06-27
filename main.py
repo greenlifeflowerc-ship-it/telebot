@@ -6,13 +6,14 @@ replies with two inline buttons:
     1. تحميل فيديو      -> choose a video quality, then download
     2. تحميل صوت MP3     -> extract the audio and convert it to MP3
 
-Every video is re-encoded with ffmpeg to a Telegram/mobile-compatible MP4
-(H.264 + AAC, yuv420p, +faststart) before sending, so it plays correctly in the
-Telegram player and saves correctly to the phone gallery.
-
-LOW_RESOURCE_MODE makes the bot stable on tiny instances (e.g. Render Free,
-512 MB RAM): it disables Full/1080p, caps height at 720p, serializes media jobs
-globally, and uses lighter ffmpeg settings.
+Compatibility + speed:
+- FAST_MODE inspects the downloaded file with ffprobe and, when it is already a
+  Telegram/mobile-friendly MP4 (H.264 + AAC + yuv420p), does a fast stream-copy
+  remux (+faststart) instead of a slow full re-encode. Only incompatible files
+  are re-encoded.
+- LOW_RESOURCE_MODE keeps the bot stable on tiny instances (e.g. Render Free,
+  512 MB): disables Full/1080p, prefers 480p, caps height at 720p, serializes
+  media jobs, and uses lighter ffmpeg settings.
 
 This app is built for WEBHOOK deployment (NOT long polling), so it runs cleanly
 as a Render Web Service behind FastAPI + Uvicorn. The webhook handler returns to
@@ -22,6 +23,7 @@ Telegram never times out.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -57,14 +59,21 @@ except ImportError:  # pragma: no cover - optional dependency
 BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET: str = os.environ.get("WEBHOOK_SECRET", "").strip()
 
+
+def _flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # Turns on the debug-only /webhook-info endpoint. Off unless explicitly enabled.
-DEBUG: bool = os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+DEBUG: bool = _flag("DEBUG")
 
 # Low-memory mode for small instances (e.g. Render Free, 512 MB RAM). Disables
-# Full/1080p, caps output height at 720p, and uses lighter ffmpeg settings.
-LOW_RESOURCE_MODE: bool = os.environ.get("LOW_RESOURCE_MODE", "").strip().lower() in (
-    "1", "true", "yes", "on"
-)
+# Full/1080p, prefers 480p, caps output height at 720p, lighter ffmpeg.
+LOW_RESOURCE_MODE: bool = _flag("LOW_RESOURCE_MODE")
+
+# Fast mode: remux compatible MP4s instead of always re-encoding (big speed win
+# on slow CPUs). Re-encode happens only when the file is not compatible.
+FAST_MODE: bool = _flag("FAST_MODE")
 
 # Telegram Bot API practical upload limit for bots is 50 MB; stay just under it.
 MAX_FILE_SIZE: int = 49 * 1024 * 1024  # 49 MB in bytes
@@ -101,15 +110,16 @@ QUALITY_LABELS: Dict[str, str] = {
     "360": "360p",
     "small": "أقل حجم / Small",
 }
-# Order the buttons are shown in.
+# Order the buttons are shown in (normal mode).
 QUALITY_ORDER: List[str] = ["full", "1080", "720", "480", "360", "small"]
 # Safe options when resolution detection is limited (some TikTok/Instagram links).
 FALLBACK_QUALITIES: List[str] = ["full", "720", "480", "small"]
-# Quality keys offered when LOW_RESOURCE_MODE is on (no Full, no 1080p).
-LOWRES_QUALITIES: List[str] = ["720", "480", "360", "small"]
+# Quality keys offered when LOW_RESOURCE_MODE is on (no Full / no 1080p).
+# 480p is listed first as the preferred/default choice for speed.
+LOWRES_QUALITIES: List[str] = ["480", "720", "360", "small"]
 # callback_data ("v_full" ...) -> quality key ("full" ...).
 VIDEO_QUALITY_ACTIONS: Dict[str, str] = {f"v_{key}": key for key in QUALITY_LABELS}
-# Target output height for the normalize step (None = keep original resolution).
+# Target output height for the re-encode step (None = keep original resolution).
 QUALITY_TARGET_HEIGHTS: Dict[str, int] = {"1080": 1080, "720": 720, "480": 480, "360": 360}
 
 # Prefix for every per-job temp folder; matched by the startup stale-folder sweep.
@@ -156,7 +166,11 @@ MSG_DOWNLOADING = "⏳ جاري التحميل، قد يستغرق ذلك بعض
 MSG_BUSY = "يوجد تحميل قيد التنفيذ حالياً، انتظر حتى ينتهي."
 MSG_SERVER_BUSY = "السيرفر يعالج طلباً آخر حالياً، حاول بعد قليل."
 MSG_VIDEO_QUALITY_MENU = "اختر دقة الفيديو:"
-MSG_DOWNLOADING_QUALITY = "جاري تحميل الفيديو بالدقة المختارة..."
+MSG_VIDEO_QUALITY_MENU_LOWRES = "اختر دقة الفيديو (يُفضّل 480p للسرعة على الخطة المجانية):"
+MSG_720_SLOW = "قد يستغرق تحميل 720p وقتاً أطول على الخطة المجانية."
+MSG_PREPARING = "جاري تجهيز الفيديو..."
+MSG_SENDING_VIDEO = "جاري إرسال الفيديو..."
+MSG_COMPRESSING = "جاري ضغط الفيديو ليتوافق مع تلغرام..."
 MSG_QUALITY_UNAVAILABLE = "هذه الدقة غير متاحة لهذا الرابط. جرّب دقة أخرى."
 MSG_FORMATS_UNREADABLE = "لم أستطع قراءة الدقات المتاحة، سأعرض خيارات آمنة للتجربة."
 MSG_MAYBE_TOO_LARGE = (
@@ -469,7 +483,7 @@ def build_video_format_selector(quality: str) -> str:
     """Map a quality key to a yt-dlp format selector string.
 
     Prefers mp4 / H.264 (avc1) formats before falling back, so the raw download
-    is already mobile-friendly when possible (normalization still runs after).
+    is already mobile-friendly when possible (then FAST_MODE can just remux).
     """
     selectors = {
         "full": (
@@ -569,9 +583,9 @@ def end_download(chat_id: int) -> None:
 def cleanup_workdir(workdir: str | Path, chat_id: int | None = None) -> None:
     """Delete a job's temp folder and everything inside it.
 
-    Removes raw yt-dlp downloads, the normalized MP4, the MP3 conversion,
-    thumbnails, fragments, and .part files — the whole folder. Safe to call
-    more than once and never raises.
+    Removes raw yt-dlp downloads, the remuxed/normalized MP4, the MP3 conversion,
+    thumbnails, fragments, and .part files — the whole folder. Safe to call more
+    than once and never raises.
     """
     shutil.rmtree(workdir, ignore_errors=True)
     if chat_id is not None:
@@ -613,7 +627,7 @@ def cleanup_stale_temp_dirs(max_age_seconds: int = 3600) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Downloading (yt-dlp) + normalization (ffmpeg)
+# Downloading (yt-dlp) + ffprobe inspection + remux/re-encode (ffmpeg)
 # --------------------------------------------------------------------------- #
 
 def _base_ydl_opts(workdir: str) -> Dict[str, Any]:
@@ -654,6 +668,116 @@ def download_video(url: str, workdir: str, quality: str = "720") -> Optional[str
     return _largest_file(workdir)
 
 
+def probe_media(path: str) -> dict:
+    """Return ffprobe JSON (streams + format) for a media file, or {} on failure.
+
+    Uses small piped output (metadata only); only the tail of stderr is logged.
+    """
+    cmd = [
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_streams", "-show_format", path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        logger.warning("ffprobe unavailable/timeout: %s", exc)
+        return {}
+    if result.returncode != 0:
+        logger.warning("ffprobe rc=%s: %s", result.returncode, (result.stderr or "")[-2000:])
+        return {}
+    try:
+        return json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def is_telegram_compatible(path: str) -> bool:
+    """True if `path` is already a Telegram/mobile-friendly MP4 (no re-encode).
+
+    Requires: .mp4 container, first video stream H.264 (avc1), pixel format
+    yuv420p (when reported), and any audio stream is AAC (no audio is fine).
+    """
+    if not path.lower().endswith(".mp4"):
+        return False
+    info = probe_media(path)
+    if not info:
+        return False
+
+    fmt = (info.get("format", {}).get("format_name") or "").lower()
+    if "mp4" not in fmt and "mov" not in fmt:
+        return False
+
+    streams = info.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if not video:
+        return False
+    if (video.get("codec_name") or "").lower() not in ("h264", "avc1"):
+        return False
+    pix = (video.get("pix_fmt") or "").lower()
+    if pix and pix != "yuv420p":
+        return False
+
+    for stream in streams:
+        if stream.get("codec_type") == "audio":
+            if (stream.get("codec_name") or "").lower() != "aac":
+                return False
+    return True
+
+
+def _run_ffmpeg(cmd: List[str], output_path: str) -> bool:
+    """Run an ffmpeg command. stderr -> a small log file (tail logged on error).
+
+    Avoids buffering large ffmpeg output in memory (no capture_output). Returns
+    True only when ffmpeg exits 0.
+    """
+    log_path = output_path + ".log"
+    try:
+        with open(log_path, "wb") as errlog:
+            result = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=errlog,
+                timeout=600,
+            )
+    except FileNotFoundError:
+        logger.error("ffmpeg not found on PATH.")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg timed out.")
+        return False
+
+    if result.returncode != 0:
+        err_tail = ""
+        try:
+            with open(log_path, "r", errors="replace") as fh:
+                err_tail = fh.read()[-2000:]
+        except OSError:
+            pass
+        logger.warning("ffmpeg failed (rc=%s): %s", result.returncode, err_tail)
+        return False
+    return True
+
+
+def remux_video(input_path: str, output_path: str) -> bool:
+    """Fast path: stream-copy into an MP4 with +faststart (no re-encode)."""
+    cmd = [
+        "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", input_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    return _run_ffmpeg(cmd, output_path)
+
+
 def normalize_video(
     input_path: str,
     output_path: str,
@@ -661,14 +785,12 @@ def normalize_video(
     crf: Optional[int] = None,
     audio_bitrate: str = "128k",
 ) -> bool:
-    """Re-encode `input_path` to a Telegram/mobile-compatible MP4.
+    """Fallback path: re-encode to a Telegram/mobile-compatible MP4.
 
     H.264 (libx264, profile main, yuv420p) + AAC, +faststart. Tuned for low
-    memory: single thread, ``ultrafast`` preset, ffmpeg stderr written to a small
-    log file inside the work dir (only the tail is logged). Audio is optional
-    (-map 0:a?) so a video with no audio still produces a valid MP4. When
-    target_height is set the video is scaled down to it (never upscaled), keeping
-    aspect ratio with even dimensions. Returns True on success.
+    memory: single thread, ``ultrafast`` preset. Audio is optional (-map 0:a?)
+    so a video with no audio still produces a valid MP4. When target_height is
+    set the video is scaled down to it (never upscaled), keeping aspect ratio.
     """
     cmd = [
         "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
@@ -677,7 +799,6 @@ def normalize_video(
         "-map", "0:v:0", "-map", "0:a?",
     ]
     if target_height:
-        # Downscale only: height = min(target, input height); width auto (even).
         cmd += ["-vf", f"scale=-2:min({target_height}\\,ih)"]
     cmd += [
         "-c:v", "libx264", "-preset", "ultrafast", "-profile:v", "main",
@@ -690,38 +811,24 @@ def normalize_video(
         "-movflags", "+faststart",
         output_path,
     ]
+    ok = _run_ffmpeg(cmd, output_path)
+    if ok:
+        logger.info("ffmpeg re-encode ok (height=%s crf=%s)", target_height, crf)
+    return ok
 
-    # Write ffmpeg stderr to a small log file (inside workdir) instead of buffering
-    # potentially large output in memory; keep only the tail when reporting errors.
-    log_path = output_path + ".log"
-    try:
-        with open(log_path, "wb") as errlog:
-            result = subprocess.run(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=errlog,
-                timeout=600,
-            )
-    except FileNotFoundError:
-        logger.error("ffmpeg not found on PATH; cannot normalize video.")
-        return False
-    except subprocess.TimeoutExpired:
-        logger.warning("ffmpeg normalization timed out.")
-        return False
 
-    if result.returncode != 0:
-        err_tail = ""
-        try:
-            with open(log_path, "r", errors="replace") as fh:
-                err_tail = fh.read()[-2000:]
-        except OSError:
-            pass
-        logger.warning("ffmpeg failed (rc=%s): %s", result.returncode, err_tail)
-        return False
-
-    logger.info("ffmpeg normalization ok (height=%s crf=%s)", target_height, crf)
-    return True
+def _reencode_params(quality: str) -> tuple[Optional[int], Optional[int], str]:
+    """(target_height, crf, audio_bitrate) for the re-encode fallback."""
+    if FAST_MODE:
+        if quality == "small":
+            return 360, 32, "96k"
+        height = QUALITY_TARGET_HEIGHTS.get(quality) or 720
+        if LOW_RESOURCE_MODE:
+            height = min(height, 720)
+        return height, 30, "96k"
+    if LOW_RESOURCE_MODE:
+        return min(QUALITY_TARGET_HEIGHTS.get(quality) or 720, 720), 28, "96k"
+    return QUALITY_TARGET_HEIGHTS.get(quality), None, "128k"
 
 
 def _find_audio_file(folder: str) -> Optional[str]:
@@ -767,9 +874,11 @@ def download_audio(url: str, workdir: str) -> Optional[str]:
 def show_quality_menu(chat_id: int, url: str) -> None:
     """Present the available quality options for a video link."""
     if LOW_RESOURCE_MODE:
-        # Fixed, lighter menu — no Full/1080p, and no extra metadata call.
+        # Fixed, lighter menu — no Full/1080p, 480p preferred, no metadata call.
         send_message(
-            chat_id, MSG_VIDEO_QUALITY_MENU, reply_markup=quality_keyboard(LOWRES_QUALITIES)
+            chat_id,
+            MSG_VIDEO_QUALITY_MENU_LOWRES,
+            reply_markup=quality_keyboard(LOWRES_QUALITIES),
         )
         return
 
@@ -785,8 +894,12 @@ def show_quality_menu(chat_id: int, url: str) -> None:
 def handle_video_request(chat_id: int, url: str, quality: str) -> None:
     workdir = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}{chat_id}_")
     try:
-        logger.info("Video request: chat=%s quality=%s low_res=%s",
-                    chat_id, quality, LOW_RESOURCE_MODE)
+        logger.info(
+            "Video request: chat=%s quality=%s fast=%s low_res=%s",
+            chat_id, quality, FAST_MODE, LOW_RESOURCE_MODE,
+        )
+        if LOW_RESOURCE_MODE and quality == "720":
+            send_message(chat_id, MSG_720_SLOW)
 
         # Best-effort pre-check: warn (but still proceed) on a large estimate.
         estimate = estimate_video_size(url, quality)
@@ -798,6 +911,7 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
                 send_message(chat_id, MSG_MAYBE_TOO_LARGE)
 
         # 1) Download the raw file (inside workdir).
+        dl_start = time.monotonic()
         try:
             raw_path = download_video(url, workdir, quality)
         except DownloadError as exc:
@@ -808,49 +922,70 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
                 logger.warning("Video download error: %s", exc)
                 send_message(chat_id, MSG_ERROR)
             return
-
         if not raw_path or not os.path.exists(raw_path):
             send_message(chat_id, MSG_QUALITY_UNAVAILABLE)
             return
         logger.info(
-            "Raw download: %s (%s)", os.path.basename(raw_path),
+            "yt-dlp download: %.1fs -> %s (%s)",
+            time.monotonic() - dl_start, os.path.basename(raw_path),
             _mb(os.path.getsize(raw_path)),
         )
 
-        # 2) Normalize to a Telegram/mobile-compatible MP4 (inside workdir). In
-        #    low-resource mode: cap at 720p, use CRF and a lower audio bitrate.
-        if LOW_RESOURCE_MODE:
-            target_height = min(QUALITY_TARGET_HEIGHTS.get(quality) or 720, 720)
-            crf: Optional[int] = 28
-            audio_bitrate = "96k"
-        else:
-            target_height = QUALITY_TARGET_HEIGHTS.get(quality)
-            crf = None
-            audio_bitrate = "128k"
+        output_path = str(Path(workdir) / "normalized_output.mp4")
 
-        normalized_path = str(Path(workdir) / "normalized_output.mp4")
-        if not normalize_video(
-            raw_path, normalized_path, target_height, crf, audio_bitrate
-        ) or not os.path.exists(normalized_path):
+        # 2) FAST_MODE: inspect and remux when already compatible; otherwise
+        #    re-encode. When FAST_MODE is off we always re-encode (as before).
+        compatible = False
+        if FAST_MODE:
+            probe_start = time.monotonic()
+            compatible = is_telegram_compatible(raw_path)
+            logger.info(
+                "ffprobe inspect: %.2fs (compatible=%s)",
+                time.monotonic() - probe_start, compatible,
+            )
+
+        proc_start = time.monotonic()
+        if compatible:
+            send_message(chat_id, MSG_SENDING_VIDEO)
+            method = "remux"
+            ok = remux_video(raw_path, output_path)
+            if not ok:
+                # Remux unexpectedly failed; fall back to a real re-encode.
+                logger.info("Remux failed; falling back to re-encode.")
+                send_message(chat_id, MSG_COMPRESSING)
+                method = "reencode"
+                th, crf, ab = _reencode_params(quality)
+                ok = normalize_video(raw_path, output_path, th, crf, ab)
+        else:
+            send_message(chat_id, MSG_COMPRESSING)
+            method = "reencode"
+            th, crf, ab = _reencode_params(quality)
+            ok = normalize_video(raw_path, output_path, th, crf, ab)
+        logger.info("%s: %.1fs", method, time.monotonic() - proc_start)
+
+        if not ok or not os.path.exists(output_path):
             send_message(chat_id, MSG_VIDEO_PROCESS_FAILED)
             return
 
-        final_size = os.path.getsize(normalized_path)
-        logger.info(
-            "Normalized: %s (%s)", os.path.basename(normalized_path), _mb(final_size)
-        )
+        final_size = os.path.getsize(output_path)
+        logger.info("Final file: %s (%s)", os.path.basename(output_path), _mb(final_size))
 
         # 3) Enforce the Telegram size limit on the FINAL file.
         if final_size > MAX_FILE_SIZE:
             send_message(
                 chat_id,
-                MSG_TOO_LARGE_LOWRES if LOW_RESOURCE_MODE else MSG_TOO_LARGE_TRY_LOWER,
+                MSG_TOO_LARGE_LOWRES if (LOW_RESOURCE_MODE or FAST_MODE) else MSG_TOO_LARGE_TRY_LOWER,
             )
             return
 
         # 4) Send as a streamable video (deleted only after this returns/fails).
-        logger.info("Sending via sendVideo")
-        if not send_video(chat_id, normalized_path, caption=MSG_VIDEO_DONE):
+        up_start = time.monotonic()
+        sent = send_video(chat_id, output_path, caption=MSG_VIDEO_DONE)
+        logger.info(
+            "Telegram upload: %.1fs (%s, method=%s)",
+            time.monotonic() - up_start, _mb(final_size), method,
+        )
+        if not sent:
             send_message(chat_id, MSG_ERROR)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Video request failed: %s", exc)
@@ -863,17 +998,22 @@ def handle_audio_request(chat_id: int, url: str) -> None:
     workdir = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}{chat_id}_")
     try:
         logger.info("Audio request: chat=%s", chat_id)
+        dl_start = time.monotonic()
         path = download_audio(url, workdir)
         if not path or not os.path.exists(path):
             send_message(chat_id, MSG_AUDIO_FAILED)
             return
 
         size = os.path.getsize(path)
-        logger.info("Audio file: %s (%s)", os.path.basename(path), _mb(size))
+        logger.info(
+            "Audio download: %.1fs -> %s (%s)",
+            time.monotonic() - dl_start, os.path.basename(path), _mb(size),
+        )
         if size > MAX_FILE_SIZE:
             send_message(chat_id, MSG_TOO_LARGE)
             return
 
+        up_start = time.monotonic()
         if path.lower().endswith(".mp3"):
             logger.info("Sending via sendAudio")
             if not send_audio(chat_id, path):
@@ -883,6 +1023,7 @@ def handle_audio_request(chat_id: int, url: str) -> None:
             # MP3 conversion didn't happen; send the raw audio as a document.
             logger.info("MP3 missing; sending raw audio via sendDocument")
             send_document(chat_id, path, caption=MSG_AUDIO_NO_MP3)
+        logger.info("Telegram upload (audio): %.1fs (%s)", time.monotonic() - up_start, _mb(size))
     except Exception as exc:  # noqa: BLE001
         logger.warning("Audio request failed: %s", exc)
         send_message(chat_id, MSG_AUDIO_FAILED)
@@ -936,7 +1077,7 @@ def handle_callback(callback: dict) -> None:
         send_message(chat_id, MSG_NO_URL)
         return
 
-    # Step 1: "تحميل فيديو" -> analyze and show the quality menu (no download yet).
+    # Step 1: "تحميل فيديو" -> show the quality menu (no download yet).
     if action == "dl_video":
         show_quality_menu(chat_id, url)
         return
@@ -953,7 +1094,7 @@ def handle_callback(callback: dict) -> None:
             return
         _run_guarded_download(
             chat_id,
-            MSG_DOWNLOADING_QUALITY,
+            MSG_PREPARING,
             lambda: handle_video_request(chat_id, url, quality),
         )
         return
@@ -989,8 +1130,10 @@ async def lifespan(_: FastAPI):
     # Fail fast on bad config, sweep any old temp folders, then register.
     validate_config()
     cleanup_stale_temp_dirs()
+    if FAST_MODE:
+        logger.info("FAST_MODE is ON (remux when compatible, re-encode only as fallback).")
     if LOW_RESOURCE_MODE:
-        logger.info("LOW_RESOURCE_MODE is ON (Full/1080p disabled, 720p cap).")
+        logger.info("LOW_RESOURCE_MODE is ON (Full/1080p disabled, 480p preferred, 720p cap).")
     register_webhook()
     yield
 
