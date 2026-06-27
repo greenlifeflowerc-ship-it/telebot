@@ -75,6 +75,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 | `WEBHOOK_SECRET`      | ✅ Yes   | Secret used in the webhook path and `secret_token` header.                  |
 | `PUBLIC_URL`              | Optional | Public HTTPS base URL. Only needed **outside Render**, or if automatic hostname detection fails. Used as-is when set. |
 | `DEBUG`                   | Optional | `true` enables the debug-only `/webhook-info` endpoint. Default off.         |
+| `LOW_RESOURCE_MODE`       | Optional | `true` for small instances (Render Free 512 MB): disables Full/1080p, caps 720p, serializes jobs, lighter ffmpeg. |
 | `RENDER_EXTERNAL_URL`     | Auto     | Injected by Render (when available) — **do not set manually**.              |
 | `RENDER_EXTERNAL_HOSTNAME`| Auto     | Render's standard host var — the app builds `https://{hostname}` from it. **Do not set manually**. |
 | `PORT`                    | Auto     | Injected by Render automatically — the app binds to it.                     |
@@ -278,6 +279,42 @@ yt-dlp already produced an mp4:
 
 If **Full** quality is too large for Telegram, pick **720p** or **480p**. Long or
 high-quality videos can still exceed the 49 MB bot limit even after normalization.
+
+---
+
+## 🪫 Low-resource mode (Render Free 512 MB)
+
+ffmpeg re-encoding is memory-hungry; on a 512 MB instance, **Full/original** and
+**1080p** can crash the worker (out-of-memory). Set **`LOW_RESOURCE_MODE=true`**
+(it is the default in `.env.example`) to keep the bot stable:
+
+- **Quality menu shows only** 720p / 480p / 360p / أقل حجم (Small) — plus the
+  MP3 button. Full/1080p are hidden, and if one is somehow requested the bot
+  replies in Arabic suggesting 720p/480p.
+- **Output height is capped at 720p** (downscale only, never upscaled).
+- **One media job at a time, server-wide.** A second user gets
+  `السيرفر يعالج طلباً آخر حالياً، حاول بعد قليل.` until the current job finishes
+  (the per-chat lock still applies too).
+- **Lighter ffmpeg:** single thread, `-preset ultrafast`, `-crf 28`, AAC 96k,
+  `-loglevel error` with stderr written to a small log file (not buffered in RAM).
+- **yt-dlp** runs with `cachedir=False`, `retries=2`, `socket_timeout=30`, and
+  `concurrent_fragment_downloads=1`.
+- If the estimated size is very large (> 80 MB) it warns and suggests 480p; if the
+  final file still exceeds 49 MB it is not sent and suggests 480p/360p.
+
+The Docker image already starts uvicorn with a single worker and a small
+concurrency cap (`--workers 1 --limit-concurrency 4`) to bound memory.
+
+### Want Full / original or 1080p?
+
+Run on something with more RAM and leave `LOW_RESOURCE_MODE` unset/`false`:
+
+- A small VPS such as **Oracle Cloud Always Free (Ampere A1)** — generous free
+  RAM/CPU, good for heavier encoding.
+- A **paid Render instance** (more RAM, always-on).
+
+On those, the full quality menu (Full / 1080p / 720p / 480p / 360p / Small) is
+available again.
 
 ---
 

@@ -223,3 +223,27 @@ mkdir -p "$(python -c 'import tempfile;print(tempfile.gettempdir())')/tg_downloa
 touch -d '2 hours ago' "$(python -c 'import tempfile;print(tempfile.gettempdir())')/tg_downloader_test_old"
 # restart the app -> log: "Startup cleanup removed 1 stale temp folder(s)."
 ```
+
+---
+
+## 8. Verify low-resource mode (Render Free 512 MB)
+
+Set `LOW_RESOURCE_MODE=true` (env var) and restart. The startup log shows
+`LOW_RESOURCE_MODE is ON (Full/1080p disabled, 720p cap).`
+
+What to verify:
+- Tap **تحميل فيديو** → the quality menu shows **only** 720p / 480p / 360p /
+  أقل حجم (Small) — no Full, no 1080p.
+- If a `v_full` / `v_1080` callback is somehow sent (e.g. an old keyboard), the
+  bot replies `الجودة الأصلية غير متاحة على الخطة المجانية...` /
+  `دقة 1080p غير متاحة...`.
+- **Global lock:** start a download in one chat, then immediately request one
+  from a **different** chat → the second gets
+  `السيرفر يعالج طلباً آخر حالياً، حاول بعد قليل.`
+- Pick **720p** on a 1080p source → the sent video is **≤ 720p** H.264/AAC.
+- Logs show the lighter pipeline, e.g.
+  `ffmpeg normalization ok (height=720 crf=28)` and
+  `Video request: chat=... quality=720 low_res=True`.
+
+With `LOW_RESOURCE_MODE` unset/`false` (bigger instance), the full menu
+(Full / 1080p / 720p / 480p / 360p / Small) returns and no 720p cap is applied.

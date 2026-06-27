@@ -25,5 +25,6 @@ ENV PORT=10000
 EXPOSE 10000
 
 # Bind to 0.0.0.0 and the Render-provided PORT. Shell form is required so that
-# ${PORT} is expanded at container start.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# ${PORT} is expanded at container start. A single worker + a small concurrency
+# limit keeps memory bounded on tiny instances (e.g. Render Free 512 MB).
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1 --limit-concurrency 4"]

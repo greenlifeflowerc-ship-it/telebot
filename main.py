@@ -10,6 +10,10 @@ Every video is re-encoded with ffmpeg to a Telegram/mobile-compatible MP4
 (H.264 + AAC, yuv420p, +faststart) before sending, so it plays correctly in the
 Telegram player and saves correctly to the phone gallery.
 
+LOW_RESOURCE_MODE makes the bot stable on tiny instances (e.g. Render Free,
+512 MB RAM): it disables Full/1080p, caps height at 720p, serializes media jobs
+globally, and uses lighter ffmpeg settings.
+
 This app is built for WEBHOOK deployment (NOT long polling), so it runs cleanly
 as a Render Web Service behind FastAPI + Uvicorn. The webhook handler returns to
 Telegram immediately and performs the slow download work in a background task so
@@ -56,8 +60,17 @@ WEBHOOK_SECRET: str = os.environ.get("WEBHOOK_SECRET", "").strip()
 # Turns on the debug-only /webhook-info endpoint. Off unless explicitly enabled.
 DEBUG: bool = os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
+# Low-memory mode for small instances (e.g. Render Free, 512 MB RAM). Disables
+# Full/1080p, caps output height at 720p, and uses lighter ffmpeg settings.
+LOW_RESOURCE_MODE: bool = os.environ.get("LOW_RESOURCE_MODE", "").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
 # Telegram Bot API practical upload limit for bots is 50 MB; stay just under it.
 MAX_FILE_SIZE: int = 49 * 1024 * 1024  # 49 MB in bytes
+
+# On a low-memory instance, warn the user before processing a clearly huge video.
+LOWRES_WARN_SIZE: int = 80 * 1024 * 1024  # 80 MB
 
 # Base URL for every Telegram Bot API call. The token lives here, so this value
 # (and any URL derived from it) must never be written to the logs.
@@ -92,6 +105,8 @@ QUALITY_LABELS: Dict[str, str] = {
 QUALITY_ORDER: List[str] = ["full", "1080", "720", "480", "360", "small"]
 # Safe options when resolution detection is limited (some TikTok/Instagram links).
 FALLBACK_QUALITIES: List[str] = ["full", "720", "480", "small"]
+# Quality keys offered when LOW_RESOURCE_MODE is on (no Full, no 1080p).
+LOWRES_QUALITIES: List[str] = ["720", "480", "360", "small"]
 # callback_data ("v_full" ...) -> quality key ("full" ...).
 VIDEO_QUALITY_ACTIONS: Dict[str, str] = {f"v_{key}": key for key in QUALITY_LABELS}
 # Target output height for the normalize step (None = keep original resolution).
@@ -104,9 +119,11 @@ TEMP_PREFIX = "tg_downloader_"
 # every restart / redeploy, which is fine for this simple flow.
 last_url_by_chat: Dict[int, str] = {}
 
-# Chats that currently have a download in progress (one active download per
-# chat). Guarded by a lock because downloads run in a threadpool.
+# Concurrency state (guarded by _downloads_lock; downloads run in a threadpool):
+#   active_downloads  -> one active download per chat_id
+#   _global_job_active -> at most ONE media job server-wide (low-memory safety)
 active_downloads: set[int] = set()
+_global_job_active: bool = False
 _downloads_lock = threading.Lock()
 
 logging.basicConfig(
@@ -137,6 +154,7 @@ MSG_CHOOSE = "تم استلام الرابط ✅\nاختر نوع التحميل
 MSG_NO_URL = "أرسل الرابط أولًا، ثم اختر فيديو أو صوت MP3."
 MSG_DOWNLOADING = "⏳ جاري التحميل، قد يستغرق ذلك بعض الوقت..."
 MSG_BUSY = "يوجد تحميل قيد التنفيذ حالياً، انتظر حتى ينتهي."
+MSG_SERVER_BUSY = "السيرفر يعالج طلباً آخر حالياً، حاول بعد قليل."
 MSG_VIDEO_QUALITY_MENU = "اختر دقة الفيديو:"
 MSG_DOWNLOADING_QUALITY = "جاري تحميل الفيديو بالدقة المختارة..."
 MSG_QUALITY_UNAVAILABLE = "هذه الدقة غير متاحة لهذا الرابط. جرّب دقة أخرى."
@@ -144,6 +162,18 @@ MSG_FORMATS_UNREADABLE = "لم أستطع قراءة الدقات المتاحة
 MSG_MAYBE_TOO_LARGE = (
     "⚠️ الحجم المتوقع كبير وقد يتجاوز حد تلغرام (حوالي 50 ميجابايت)، "
     "سأحاول التحميل على أي حال."
+)
+MSG_LOWRES_BIG = (
+    "⚠️ هذا الفيديو كبير وقد لا تتحمله الخطة المجانية بسبب محدودية الرام. "
+    "جرّب دقة أقل مثل 480p."
+)
+MSG_FULL_BLOCKED_LOWRES = (
+    "الجودة الأصلية غير متاحة على الخطة المجانية بسبب محدودية الرام. "
+    "جرّب 720p أو 480p."
+)
+MSG_1080_BLOCKED_LOWRES = (
+    "دقة 1080p غير متاحة على الخطة المجانية بسبب محدودية الرام. "
+    "جرّب 720p أو 480p."
 )
 MSG_VIDEO_DONE = "تم تحميل الفيديو."
 MSG_VIDEO_PROCESS_FAILED = (
@@ -155,6 +185,9 @@ MSG_TOO_LARGE = (
 )
 MSG_TOO_LARGE_TRY_LOWER = (
     "الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 720p أو 480p."
+)
+MSG_TOO_LARGE_LOWRES = (
+    "الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 480p أو 360p."
 )
 MSG_AUDIO_NO_MP3 = "تم تحميل الصوت، لكن لم أستطع تحويله إلى MP3."
 MSG_AUDIO_FAILED = "فشل تحميل الصوت. جرّب رابط آخر أو تأكد أن الرابط عام."
@@ -386,21 +419,21 @@ def quality_keyboard(options: List[str]) -> dict:
 # --------------------------------------------------------------------------- #
 
 def get_available_quality_options(url: str) -> Optional[List[str]]:
-    """Quality keys to offer for a URL.
+    """Quality keys to offer for a URL (used only when LOW_RESOURCE_MODE is off).
 
     Returns:
         None  -> yt-dlp could not read the formats at all (caller shows a notice).
         list  -> quality keys to show. May be the safe FALLBACK_QUALITIES when
                  resolution info is limited (e.g. some TikTok/Instagram links).
-
-    Only resolutions that the source can actually provide (that height or a
-    close lower format) are included. We never store the (large) info object.
     """
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
+        "cachedir": False,
+        "retries": 2,
+        "socket_timeout": 30,
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -421,14 +454,11 @@ def get_available_quality_options(url: str) -> Optional[List[str]]:
         heights.add(int(info["height"]))
 
     if not heights:
-        # Formats were readable but carried no resolution info -> safe fallback.
         return list(FALLBACK_QUALITIES)
 
     max_height = max(heights)
     options = ["full"]
     for res in (1080, 720, 480, 360):
-        # Show the cap if the source is at least that tall, or has a close
-        # lower format (within ~10%) that the selector would fall back to.
         if max_height >= res or any(h >= res * 0.9 for h in heights):
             options.append(str(res))
     options.append("small")
@@ -452,15 +482,15 @@ def build_video_format_selector(quality: str) -> str:
         ),
         "720": (
             "bestvideo[height<=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "best[height<=720][ext=mp4][vcodec^=avc1]/best[height<=720]"
+            "best[height<=720][ext=mp4]/best[height<=720]"
         ),
         "480": (
             "bestvideo[height<=480][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "best[height<=480][ext=mp4][vcodec^=avc1]/best[height<=480]"
+            "best[height<=480][ext=mp4]/best[height<=480]"
         ),
         "360": (
             "bestvideo[height<=360][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "best[height<=360][ext=mp4][vcodec^=avc1]/best[height<=360]"
+            "best[height<=360][ext=mp4]/best[height<=360]"
         ),
         "small": "worst[ext=mp4]/worst",
     }
@@ -479,6 +509,9 @@ def estimate_video_size(url: str, quality: str) -> Optional[int]:
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "cachedir": False,
+        "retries": 2,
+        "socket_timeout": 30,
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -501,21 +534,32 @@ def estimate_video_size(url: str, quality: str) -> Optional[int]:
 
 
 # --------------------------------------------------------------------------- #
-# Concurrency control — one active download per chat
+# Concurrency control — one per chat AND one global media job
 # --------------------------------------------------------------------------- #
 
-def try_begin_download(chat_id: int) -> bool:
-    """Reserve the single download slot for a chat. False if one is running."""
+def try_begin_download(chat_id: int) -> tuple[bool, Optional[str]]:
+    """Reserve the per-chat slot AND the single global job slot.
+
+    Returns (True, None) on success, or (False, arabic_reason) when this chat is
+    already downloading, or another media job is running anywhere on the server
+    (only one ffmpeg/yt-dlp job at a time keeps memory bounded on small hosts).
+    """
+    global _global_job_active
     with _downloads_lock:
         if chat_id in active_downloads:
-            return False
+            return False, MSG_BUSY
+        if _global_job_active:
+            return False, MSG_SERVER_BUSY
         active_downloads.add(chat_id)
-        return True
+        _global_job_active = True
+        return True, None
 
 
 def end_download(chat_id: int) -> None:
+    global _global_job_active
     with _downloads_lock:
         active_downloads.discard(chat_id)
+        _global_job_active = False
 
 
 # --------------------------------------------------------------------------- #
@@ -572,6 +616,22 @@ def cleanup_stale_temp_dirs(max_age_seconds: int = 3600) -> None:
 # Downloading (yt-dlp) + normalization (ffmpeg)
 # --------------------------------------------------------------------------- #
 
+def _base_ydl_opts(workdir: str) -> Dict[str, Any]:
+    """Shared yt-dlp options: everything stays in workdir, low-resource friendly."""
+    return {
+        # All output (and any fragments/.part files) stays inside workdir.
+        "outtmpl": str(Path(workdir) / "%(title).80s-%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "restrictfilenames": True,
+        "quiet": True,
+        "no_warnings": True,
+        "cachedir": False,
+        "retries": 2,
+        "socket_timeout": 30,
+        "concurrent_fragment_downloads": 1,
+    }
+
+
 def _largest_file(folder: str) -> Optional[str]:
     """Return the largest regular file in a folder (the media output)."""
     candidates = [
@@ -586,33 +646,33 @@ def _largest_file(folder: str) -> Optional[str]:
 
 def download_video(url: str, workdir: str, quality: str = "720") -> Optional[str]:
     """Download the raw video into `workdir` using the selector for `quality`."""
-    opts: Dict[str, Any] = {
-        "format": build_video_format_selector(quality),
-        # All output (and any fragments/.part files) stays inside workdir.
-        "outtmpl": str(Path(workdir) / "%(title).80s-%(id)s.%(ext)s"),
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "restrictfilenames": True,
-    }
+    opts = _base_ydl_opts(workdir)
+    opts["format"] = build_video_format_selector(quality)
+    opts["merge_output_format"] = "mp4"
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
     return _largest_file(workdir)
 
 
 def normalize_video(
-    input_path: str, output_path: str, target_height: Optional[int] = None
+    input_path: str,
+    output_path: str,
+    target_height: Optional[int] = None,
+    crf: Optional[int] = None,
+    audio_bitrate: str = "128k",
 ) -> bool:
     """Re-encode `input_path` to a Telegram/mobile-compatible MP4.
 
-    H.264 (libx264, profile main, yuv420p) + AAC, +faststart. Audio is optional
+    H.264 (libx264, profile main, yuv420p) + AAC, +faststart. Tuned for low
+    memory: single thread, ``ultrafast`` preset, ffmpeg stderr written to a small
+    log file inside the work dir (only the tail is logged). Audio is optional
     (-map 0:a?) so a video with no audio still produces a valid MP4. When
     target_height is set the video is scaled down to it (never upscaled), keeping
     aspect ratio with even dimensions. Returns True on success.
     """
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-threads", "1",
         "-i", input_path,
         "-map", "0:v:0", "-map", "0:a?",
     ]
@@ -620,14 +680,29 @@ def normalize_video(
         # Downscale only: height = min(target, input height); width auto (even).
         cmd += ["-vf", f"scale=-2:min({target_height}\\,ih)"]
     cmd += [
-        "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main",
+        "-c:v", "libx264", "-preset", "ultrafast", "-profile:v", "main",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
+    ]
+    if crf is not None:
+        cmd += ["-crf", str(crf)]
+    cmd += [
+        "-c:a", "aac", "-b:a", audio_bitrate,
         "-movflags", "+faststart",
         output_path,
     ]
+
+    # Write ffmpeg stderr to a small log file (inside workdir) instead of buffering
+    # potentially large output in memory; keep only the tail when reporting errors.
+    log_path = output_path + ".log"
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        with open(log_path, "wb") as errlog:
+            result = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=errlog,
+                timeout=600,
+            )
     except FileNotFoundError:
         logger.error("ffmpeg not found on PATH; cannot normalize video.")
         return False
@@ -636,11 +711,16 @@ def normalize_video(
         return False
 
     if result.returncode != 0:
-        tail = (result.stderr or "")[-500:]
-        logger.warning("ffmpeg failed (rc=%s): %s", result.returncode, tail)
+        err_tail = ""
+        try:
+            with open(log_path, "r", errors="replace") as fh:
+                err_tail = fh.read()[-2000:]
+        except OSError:
+            pass
+        logger.warning("ffmpeg failed (rc=%s): %s", result.returncode, err_tail)
         return False
 
-    logger.info("ffmpeg normalization ok (target_height=%s)", target_height)
+    logger.info("ffmpeg normalization ok (height=%s crf=%s)", target_height, crf)
     return True
 
 
@@ -663,22 +743,15 @@ def download_audio(url: str, workdir: str) -> Optional[str]:
     Returns the resulting file path. If the MP3 conversion failed but a raw
     audio file was produced, that path is returned instead (caller handles it).
     """
-    opts: Dict[str, Any] = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
-        # All output (raw audio + the converted mp3) stays inside workdir.
-        "outtmpl": str(Path(workdir) / "%(title).80s-%(id)s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "restrictfilenames": True,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ],
-    }
+    opts = _base_ydl_opts(workdir)
+    opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
+    opts["postprocessors"] = [
+        {
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }
+    ]
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
@@ -692,10 +765,16 @@ def download_audio(url: str, workdir: str) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 
 def show_quality_menu(chat_id: int, url: str) -> None:
-    """Analyze the URL and present the available quality options."""
+    """Present the available quality options for a video link."""
+    if LOW_RESOURCE_MODE:
+        # Fixed, lighter menu — no Full/1080p, and no extra metadata call.
+        send_message(
+            chat_id, MSG_VIDEO_QUALITY_MENU, reply_markup=quality_keyboard(LOWRES_QUALITIES)
+        )
+        return
+
     options = get_available_quality_options(url)
     if options is None:
-        # Could not read formats at all: tell the user and offer safe options.
         send_message(chat_id, MSG_FORMATS_UNREADABLE)
         options = list(FALLBACK_QUALITIES)
     send_message(
@@ -706,14 +785,17 @@ def show_quality_menu(chat_id: int, url: str) -> None:
 def handle_video_request(chat_id: int, url: str, quality: str) -> None:
     workdir = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}{chat_id}_")
     try:
-        logger.info("Video request: chat=%s quality=%s", chat_id, quality)
+        logger.info("Video request: chat=%s quality=%s low_res=%s",
+                    chat_id, quality, LOW_RESOURCE_MODE)
 
-        # Best-effort pre-check: warn (but still proceed) on a large estimate,
-        # since estimates are often wrong — especially for "Full".
+        # Best-effort pre-check: warn (but still proceed) on a large estimate.
         estimate = estimate_video_size(url, quality)
-        if estimate and estimate > MAX_FILE_SIZE:
-            logger.info("Pre-download estimate %s exceeds limit", _mb(estimate))
-            send_message(chat_id, MSG_MAYBE_TOO_LARGE)
+        if estimate:
+            logger.info("Pre-download estimate: %s", _mb(estimate))
+            if LOW_RESOURCE_MODE and estimate > LOWRES_WARN_SIZE:
+                send_message(chat_id, MSG_LOWRES_BIG)
+            elif estimate > MAX_FILE_SIZE:
+                send_message(chat_id, MSG_MAYBE_TOO_LARGE)
 
         # 1) Download the raw file (inside workdir).
         try:
@@ -735,13 +817,21 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
             _mb(os.path.getsize(raw_path)),
         )
 
-        # 2) Normalize to a Telegram/mobile-compatible MP4 (inside workdir). We
-        #    never send the raw file directly — a broken codec is the bug.
+        # 2) Normalize to a Telegram/mobile-compatible MP4 (inside workdir). In
+        #    low-resource mode: cap at 720p, use CRF and a lower audio bitrate.
+        if LOW_RESOURCE_MODE:
+            target_height = min(QUALITY_TARGET_HEIGHTS.get(quality) or 720, 720)
+            crf: Optional[int] = 28
+            audio_bitrate = "96k"
+        else:
+            target_height = QUALITY_TARGET_HEIGHTS.get(quality)
+            crf = None
+            audio_bitrate = "128k"
+
         normalized_path = str(Path(workdir) / "normalized_output.mp4")
-        target_height = QUALITY_TARGET_HEIGHTS.get(quality)
-        if not normalize_video(raw_path, normalized_path, target_height) or not os.path.exists(
-            normalized_path
-        ):
+        if not normalize_video(
+            raw_path, normalized_path, target_height, crf, audio_bitrate
+        ) or not os.path.exists(normalized_path):
             send_message(chat_id, MSG_VIDEO_PROCESS_FAILED)
             return
 
@@ -752,7 +842,10 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
 
         # 3) Enforce the Telegram size limit on the FINAL file.
         if final_size > MAX_FILE_SIZE:
-            send_message(chat_id, MSG_TOO_LARGE_TRY_LOWER)
+            send_message(
+                chat_id,
+                MSG_TOO_LARGE_LOWRES if LOW_RESOURCE_MODE else MSG_TOO_LARGE_TRY_LOWER,
+            )
             return
 
         # 4) Send as a streamable video (deleted only after this returns/fails).
@@ -817,9 +910,10 @@ def handle_message(message: dict) -> None:
 
 
 def _run_guarded_download(chat_id: int, status_msg: str, work) -> None:
-    """Enforce one active download per chat around a download callable."""
-    if not try_begin_download(chat_id):
-        send_message(chat_id, MSG_BUSY)
+    """Enforce one-per-chat AND one-global media job around a download callable."""
+    ok, reason = try_begin_download(chat_id)
+    if not ok:
+        send_message(chat_id, reason)
         return
     try:
         send_message(chat_id, status_msg)
@@ -850,6 +944,13 @@ def handle_callback(callback: dict) -> None:
     # Step 2: a concrete video quality -> guarded download.
     if action in VIDEO_QUALITY_ACTIONS:
         quality = VIDEO_QUALITY_ACTIONS[action]
+        # On low-memory instances, Full/1080p are not allowed.
+        if LOW_RESOURCE_MODE and quality == "full":
+            send_message(chat_id, MSG_FULL_BLOCKED_LOWRES)
+            return
+        if LOW_RESOURCE_MODE and quality == "1080":
+            send_message(chat_id, MSG_1080_BLOCKED_LOWRES)
+            return
         _run_guarded_download(
             chat_id,
             MSG_DOWNLOADING_QUALITY,
@@ -888,6 +989,8 @@ async def lifespan(_: FastAPI):
     # Fail fast on bad config, sweep any old temp folders, then register.
     validate_config()
     cleanup_stale_temp_dirs()
+    if LOW_RESOURCE_MODE:
+        logger.info("LOW_RESOURCE_MODE is ON (Full/1080p disabled, 720p cap).")
     register_webhook()
     yield
 
