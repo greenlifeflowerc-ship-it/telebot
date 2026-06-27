@@ -67,10 +67,21 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 | --------------------- | -------- | --------------------------------------------------------------------------- |
 | `BOT_TOKEN`           | ✅ Yes   | Token from BotFather.                                                        |
 | `WEBHOOK_SECRET`      | ✅ Yes   | Secret used in the webhook path and `secret_token` header.                  |
-| `PUBLIC_URL`          | Optional | Public HTTPS base URL. Fallback for when `RENDER_EXTERNAL_URL` is missing.   |
-| `DEBUG`               | Optional | `true` enables the debug-only `/webhook-info` endpoint. Default off.         |
-| `RENDER_EXTERNAL_URL` | Auto     | Injected by Render automatically — **do not set manually**.                 |
-| `PORT`                | Auto     | Injected by Render automatically — the app binds to it.                     |
+| `PUBLIC_URL`              | Optional | Public HTTPS base URL. Only needed **outside Render**, or if automatic hostname detection fails. Used as-is when set. |
+| `DEBUG`                   | Optional | `true` enables the debug-only `/webhook-info` endpoint. Default off.         |
+| `RENDER_EXTERNAL_URL`     | Auto     | Injected by Render (when available) — **do not set manually**.              |
+| `RENDER_EXTERNAL_HOSTNAME`| Auto     | Render's standard host var — the app builds `https://{hostname}` from it. **Do not set manually**. |
+| `PORT`                    | Auto     | Injected by Render automatically — the app binds to it.                     |
+
+**How the public URL is resolved** (first match wins):
+
+1. `PUBLIC_URL` — used as-is.
+2. `RENDER_EXTERNAL_URL` — used as-is.
+3. `https://{RENDER_EXTERNAL_HOSTNAME}` — built automatically on Render.
+4. Otherwise the app fails on startup with a clear error.
+
+On Render you normally set **nothing** for the URL — `RENDER_EXTERNAL_HOSTNAME`
+(or `RENDER_EXTERNAL_URL`) is detected automatically.
 
 On startup the app **validates** that `BOT_TOKEN`, `WEBHOOK_SECRET` (safe
 characters only), and a public URL are all present. If any are missing or
@@ -79,7 +90,7 @@ invalid it logs the problem and **exits** instead of starting in a broken state.
 The webhook is registered automatically on startup at:
 
 ```
-{PUBLIC_URL or RENDER_EXTERNAL_URL}/webhook/{WEBHOOK_SECRET}
+{resolved public URL}/webhook/{WEBHOOK_SECRET}
 ```
 
 ---
@@ -104,8 +115,10 @@ The webhook is registered automatically on startup at:
 5. (Optional) Set **Health Check Path** to `/health`.
 6. Create the service and wait for it to go live.
 
-On startup the app reads `RENDER_EXTERNAL_URL`, builds the webhook URL, and calls
-Telegram's `setWebhook` for you. No manual webhook step is needed.
+On startup the app detects its public URL automatically on Render (from
+`RENDER_EXTERNAL_HOSTNAME`, or `RENDER_EXTERNAL_URL` if present), builds the
+webhook URL, and calls Telegram's `setWebhook` for you. No manual webhook step
+is needed.
 
 ### Run locally with Docker
 

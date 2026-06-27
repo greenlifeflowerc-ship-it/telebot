@@ -184,13 +184,27 @@ def send_audio(chat_id: int, path: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def public_base_url() -> str:
-    """Public HTTPS base URL of this service.
+    """Public HTTPS base URL of this service, resolved in priority order:
 
-    Render injects RENDER_EXTERNAL_URL automatically; PUBLIC_URL is the manual
-    fallback for other hosts or local tunnels.
+    1. PUBLIC_URL                      -> used as-is (override / non-Render / tunnels)
+    2. RENDER_EXTERNAL_URL             -> used as-is (full URL, if Render provides it)
+    3. https://{RENDER_EXTERNAL_HOSTNAME}  -> built from Render's default host var
+
+    Returns "" when none are set; validate_config() turns that into a clear error.
     """
-    base = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("PUBLIC_URL") or ""
-    return base.strip().rstrip("/")
+    public_url = os.environ.get("PUBLIC_URL", "").strip()
+    if public_url:
+        return public_url.rstrip("/")
+
+    external_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    if external_url:
+        return external_url.rstrip("/")
+
+    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
+    if hostname:
+        return f"https://{hostname}".rstrip("/")
+
+    return ""
 
 
 def validate_config() -> None:
@@ -205,7 +219,10 @@ def validate_config() -> None:
             "WEBHOOK_SECRET must contain only these characters: A-Z a-z 0-9 _ -"
         )
     if not public_base_url():
-        problems.append("Neither RENDER_EXTERNAL_URL nor PUBLIC_URL is set.")
+        problems.append(
+            "No public URL found. Set PUBLIC_URL, or run on Render where "
+            "RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME is provided."
+        )
 
     if problems:
         message = (

@@ -37,6 +37,11 @@ ngrok http 10000
 # Then set PUBLIC_URL=https://<your-id>.ngrok-free.app in .env and restart.
 ```
 
+**Public URL resolution.** On Render the app finds its URL automatically from
+`RENDER_EXTERNAL_HOSTNAME` (building `https://{hostname}`), or from
+`RENDER_EXTERNAL_URL` if present. `PUBLIC_URL` is only needed **outside Render**
+(like the ngrok tunnel above) or if automatic hostname detection fails.
+
 On startup the app validates config and registers the webhook automatically.
 If `BOT_TOKEN`, `WEBHOOK_SECRET`, or a public URL is missing/invalid, the app
 exits and prints exactly what to fix.
