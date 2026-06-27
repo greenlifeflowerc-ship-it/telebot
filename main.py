@@ -3,7 +3,7 @@ Telegram video / audio downloader bot — webhook architecture for Render Web Se
 
 The user sends a public video URL (YouTube / TikTok / Instagram) and the bot
 replies with two inline buttons:
-    1. تحميل فيديو      -> download the video (mp4 preferred, <= ~49 MB)
+    1. تحميل فيديو      -> choose a video quality, then download (mp4 preferred)
     2. تحميل صوت MP3     -> extract the audio and convert it to MP3
 
 This app is built for WEBHOOK deployment (NOT long polling), so it runs cleanly
@@ -21,12 +21,13 @@ import shutil
 import tempfile
 import threading
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
 import yt_dlp
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from yt_dlp.utils import DownloadError
 
 # Load a local .env file when running outside Render (no-op if python-dotenv or
 # the file is missing). On Render the variables come from the dashboard instead.
@@ -70,6 +71,23 @@ _SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 # First http(s) link inside a text message.
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
+# Video quality keys -> label shown on the inline button. callback_data is the
+# key prefixed with "v_" (kept short for Telegram's callback length limit).
+QUALITY_LABELS: Dict[str, str] = {
+    "full": "الجودة الأصلية / Full",
+    "1080": "1080p",
+    "720": "720p",
+    "480": "480p",
+    "360": "360p",
+    "small": "أقل حجم / Small",
+}
+# Order the buttons are shown in.
+QUALITY_ORDER: List[str] = ["full", "1080", "720", "480", "360", "small"]
+# Safe options when resolution detection is limited (some TikTok/Instagram links).
+FALLBACK_QUALITIES: List[str] = ["full", "720", "480", "small"]
+# callback_data ("v_full" ...) -> quality key ("full" ...).
+VIDEO_QUALITY_ACTIONS: Dict[str, str] = {f"v_{key}": key for key in QUALITY_LABELS}
+
 # Per-chat memory of the last URL the user sent. In-memory only: cleared on
 # every restart / redeploy, which is fine for this simple flow.
 last_url_by_chat: Dict[int, str] = {}
@@ -102,9 +120,20 @@ MSG_CHOOSE = "تم استلام الرابط ✅\nاختر نوع التحميل
 MSG_NO_URL = "أرسل الرابط أولًا، ثم اختر فيديو أو صوت MP3."
 MSG_DOWNLOADING = "⏳ جاري التحميل، قد يستغرق ذلك بعض الوقت..."
 MSG_BUSY = "يوجد تحميل قيد التنفيذ حالياً، انتظر حتى ينتهي."
+MSG_VIDEO_QUALITY_MENU = "اختر دقة الفيديو:"
+MSG_DOWNLOADING_QUALITY = "جاري تحميل الفيديو بالدقة المختارة..."
+MSG_QUALITY_UNAVAILABLE = "هذه الدقة غير متاحة لهذا الرابط. جرّب دقة أخرى."
+MSG_FORMATS_UNREADABLE = "لم أستطع قراءة الدقات المتاحة، سأعرض خيارات آمنة للتجربة."
+MSG_MAYBE_TOO_LARGE = (
+    "⚠️ الحجم المتوقع كبير وقد يتجاوز حد تلغرام (حوالي 50 ميجابايت)، "
+    "سأحاول التحميل على أي حال."
+)
 MSG_TOO_LARGE = (
     "⚠️ حجم الملف أكبر من الحد المسموح به في تيليجرام (حوالي 50 ميجابايت)، "
     "لذلك لا يمكن إرساله.\nجرّب فيديو أقصر أو جودة أقل."
+)
+MSG_TOO_LARGE_TRY_LOWER = (
+    "الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 720p أو 480p."
 )
 MSG_ERROR = (
     "حدث خطأ أثناء المعالجة.\n"
@@ -287,14 +316,141 @@ def is_allowed(url: str) -> bool:
 
 
 def download_keyboard() -> dict:
+    """First-level menu: pick video (opens quality menu) or audio."""
     return {
         "inline_keyboard": [
             [
                 {"text": "تحميل فيديو", "callback_data": "dl_video"},
-                {"text": "تحميل صوت MP3", "callback_data": "dl_audio"},
+                {"text": "تحميل صوت MP3", "callback_data": "audio"},
             ]
         ]
     }
+
+
+def quality_keyboard(options: List[str]) -> dict:
+    """Build the quality inline keyboard (two buttons per row)."""
+    rows: List[List[dict]] = []
+    row: List[dict] = []
+    for key in options:
+        row.append({"text": QUALITY_LABELS[key], "callback_data": f"v_{key}"})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return {"inline_keyboard": rows}
+
+
+# --------------------------------------------------------------------------- #
+# Quality detection + format selection
+# --------------------------------------------------------------------------- #
+
+def get_available_quality_options(url: str) -> Optional[List[str]]:
+    """Quality keys to offer for a URL.
+
+    Returns:
+        None  -> yt-dlp could not read the formats at all (caller shows a notice).
+        list  -> quality keys to show. May be the safe FALLBACK_QUALITIES when
+                 resolution info is limited (e.g. some TikTok/Instagram links).
+
+    Only resolutions that the source can actually provide (that height or a
+    close lower format) are included. We never store the (large) info object.
+    """
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:  # noqa: BLE001 - any failure -> safe fallback path
+        logger.warning("Quality analysis failed: %s", exc)
+        return None
+
+    if not info:
+        return None
+
+    heights = set()
+    for fmt in info.get("formats") or []:
+        height = fmt.get("height")
+        if height and fmt.get("vcodec") not in (None, "none"):
+            heights.add(int(height))
+    if not heights and info.get("height"):
+        heights.add(int(info["height"]))
+
+    if not heights:
+        # Formats were readable but carried no resolution info -> safe fallback.
+        return list(FALLBACK_QUALITIES)
+
+    max_height = max(heights)
+    options = ["full"]
+    for res in (1080, 720, 480, 360):
+        # Show the cap if the source is at least that tall, or has a close
+        # lower format (within ~10%) that the selector would fall back to.
+        if max_height >= res or any(h >= res * 0.9 for h in heights):
+            options.append(str(res))
+    options.append("small")
+    return options
+
+
+def build_video_format_selector(quality: str) -> str:
+    """Map a quality key to a yt-dlp format selector string."""
+    selectors = {
+        "full": "bestvideo+bestaudio/best",
+        "1080": (
+            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+            "best[height<=1080][ext=mp4]/best[height<=1080]"
+        ),
+        "720": (
+            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+            "best[height<=720][ext=mp4]/best[height<=720]"
+        ),
+        "480": (
+            "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
+            "best[height<=480][ext=mp4]/best[height<=480]"
+        ),
+        "360": (
+            "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/"
+            "best[height<=360][ext=mp4]/best[height<=360]"
+        ),
+        "small": "worst[ext=mp4]/worst",
+    }
+    return selectors.get(quality, selectors["720"])
+
+
+def estimate_video_size(url: str, quality: str) -> Optional[int]:
+    """Best-effort estimated size (bytes) for the chosen quality, or None.
+
+    Uses filesize / filesize_approx from yt-dlp without downloading. The info
+    object is discarded immediately and never stored.
+    """
+    opts = {
+        "format": build_video_format_selector(quality),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Size estimate failed: %s", exc)
+        return None
+    if not info:
+        return None
+
+    requested = info.get("requested_formats")
+    if requested:  # merged video + audio
+        total = 0
+        for fmt in requested:
+            size = fmt.get("filesize") or fmt.get("filesize_approx")
+            if size:
+                total += size
+        return total or None
+    return info.get("filesize") or info.get("filesize_approx")
 
 
 # --------------------------------------------------------------------------- #
@@ -331,15 +487,10 @@ def _largest_file(folder: str) -> Optional[str]:
     return max(candidates, key=os.path.getsize)
 
 
-def download_video(url: str, folder: str) -> Optional[str]:
-    """Download the video into `folder`, preferring mp4 at 720p or lower."""
+def download_video(url: str, folder: str, quality: str = "720") -> Optional[str]:
+    """Download the video into `folder` using the selector for `quality`."""
     opts: Dict[str, Any] = {
-        # Prefer a 720p mp4; fall back step by step to whatever is available.
-        "format": (
-            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=720][ext=mp4]/"
-            "best[height<=720]/best"
-        ),
+        "format": build_video_format_selector(quality),
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -382,15 +533,43 @@ def download_audio(url: str, folder: str) -> Optional[str]:
 # Request handlers (run inside a background task / threadpool)
 # --------------------------------------------------------------------------- #
 
-def handle_video_request(chat_id: int, url: str) -> None:
+def show_quality_menu(chat_id: int, url: str) -> None:
+    """Analyze the URL and present the available quality options."""
+    options = get_available_quality_options(url)
+    if options is None:
+        # Could not read formats at all: tell the user and offer safe options.
+        send_message(chat_id, MSG_FORMATS_UNREADABLE)
+        options = list(FALLBACK_QUALITIES)
+    send_message(
+        chat_id, MSG_VIDEO_QUALITY_MENU, reply_markup=quality_keyboard(options)
+    )
+
+
+def handle_video_request(chat_id: int, url: str, quality: str) -> None:
     folder = tempfile.mkdtemp(prefix="dlbot_")
     try:
-        path = download_video(url, folder)
+        # Best-effort pre-check: warn (but still proceed) on a large estimate,
+        # since estimates are often wrong — especially for "Full".
+        estimate = estimate_video_size(url, quality)
+        if estimate and estimate > MAX_FILE_SIZE:
+            send_message(chat_id, MSG_MAYBE_TOO_LARGE)
+
+        try:
+            path = download_video(url, folder, quality)
+        except DownloadError as exc:
+            text = str(exc).lower()
+            if "requested format" in text or "not available" in text or "no video" in text:
+                send_message(chat_id, MSG_QUALITY_UNAVAILABLE)
+            else:
+                logger.warning("Video download error: %s", exc)
+                send_message(chat_id, MSG_ERROR)
+            return
+
         if not path or not os.path.exists(path):
-            send_message(chat_id, MSG_ERROR)
+            send_message(chat_id, MSG_QUALITY_UNAVAILABLE)
             return
         if os.path.getsize(path) > MAX_FILE_SIZE:
-            send_message(chat_id, MSG_TOO_LARGE)
+            send_message(chat_id, MSG_TOO_LARGE_TRY_LOWER)
             return
         if path.lower().endswith(".mp4"):
             send_video(chat_id, path)
@@ -440,13 +619,22 @@ def handle_message(message: dict) -> None:
     send_message(chat_id, MSG_CHOOSE, reply_markup=download_keyboard())
 
 
+def _run_guarded_download(chat_id: int, status_msg: str, work) -> None:
+    """Enforce one active download per chat around a download callable."""
+    if not try_begin_download(chat_id):
+        send_message(chat_id, MSG_BUSY)
+        return
+    try:
+        send_message(chat_id, status_msg)
+        work()
+    finally:
+        end_download(chat_id)
+
+
 def handle_callback(callback: dict) -> None:
     answer_callback(callback["id"])  # stop the button's loading spinner
 
     action = callback.get("data")
-    if action not in ("dl_video", "dl_audio"):
-        return
-
     message = callback.get("message") or {}
     chat_id = message.get("chat", {}).get("id")
     if chat_id is None:
@@ -457,19 +645,30 @@ def handle_callback(callback: dict) -> None:
         send_message(chat_id, MSG_NO_URL)
         return
 
-    # Enforce one active download per chat.
-    if not try_begin_download(chat_id):
-        send_message(chat_id, MSG_BUSY)
+    # Step 1: "تحميل فيديو" -> analyze and show the quality menu (no download yet).
+    if action == "dl_video":
+        show_quality_menu(chat_id, url)
         return
 
-    try:
-        send_message(chat_id, MSG_DOWNLOADING)
-        if action == "dl_video":
-            handle_video_request(chat_id, url)
-        else:  # "dl_audio"
-            handle_audio_request(chat_id, url)
-    finally:
-        end_download(chat_id)
+    # Step 2: a concrete video quality -> guarded download.
+    if action in VIDEO_QUALITY_ACTIONS:
+        quality = VIDEO_QUALITY_ACTIONS[action]
+        _run_guarded_download(
+            chat_id,
+            MSG_DOWNLOADING_QUALITY,
+            lambda: handle_video_request(chat_id, url, quality),
+        )
+        return
+
+    # Audio path is unchanged.
+    if action == "audio":
+        _run_guarded_download(
+            chat_id,
+            MSG_DOWNLOADING,
+            lambda: handle_audio_request(chat_id, url),
+        )
+        return
+    # Unknown callback -> ignore.
 
 
 def process_update(update: dict) -> None:

@@ -7,11 +7,15 @@ Built for **Render Web Service** deployment using a **webhook** architecture
 (FastAPI + Uvicorn + yt-dlp + ffmpeg). It does **not** use long polling.
 
 ```
-User sends a link  ->  Bot shows two buttons  ->  [تحميل فيديو] / [تحميل صوت MP3]
-                                                        |
-                                          yt-dlp + ffmpeg download
-                                                        |
-                                     sendVideo / sendDocument / sendAudio
+User sends a link  ->  [تحميل فيديو] / [تحميل صوت MP3]
+                              |                  |
+                   quality menu (Full /     bestaudio -> MP3
+                   1080p/720p/480p/360p/         |
+                   Small)                    sendAudio
+                              |
+                    yt-dlp + ffmpeg download
+                              |
+                  sendVideo (mp4) / sendDocument
 ```
 
 ---
@@ -162,7 +166,9 @@ Then test the bot itself:
    You should get the Arabic welcome message.
 2. Send a public link, e.g. a YouTube URL.
    The bot replies with **تحميل فيديو** / **تحميل صوت MP3** buttons.
-3. Tap a button. The bot sends `⏳ جاري التحميل...` and then the file.
+3. Tap **تحميل فيديو** → a quality menu (`اختر دقة الفيديو:`) appears; pick a
+   resolution and the bot downloads and sends the file. Tap **تحميل صوت MP3**
+   for an MP3 instead.
 
 ### Service endpoints
 
@@ -209,6 +215,40 @@ YouTube/TikTok/Instagram change their internals frequently, which can break
 downloads until `yt-dlp` is updated. `requirements.txt` keeps `yt-dlp`
 unpinned, so a **fresh deploy** (Manual Deploy → *Clear build cache & deploy* on
 Render) pulls the latest version. If downloads suddenly start failing, redeploy.
+
+---
+
+## 🎚️ Video quality selection
+
+Tapping **تحميل فيديو** no longer downloads immediately. The bot first inspects
+the link with `yt-dlp` (metadata only, `download=False`) and shows the
+resolutions that link can actually provide:
+
+| Button (Arabic / label)   | Behaviour                                                       |
+| ------------------------- | -------------------------------------------------------------- |
+| الجودة الأصلية / Full     | Best available — `bestvideo+bestaudio/best`, merged to mp4.     |
+| 1080p                     | Best video up to 1080p + best audio.                           |
+| 720p                      | Best video up to 720p + best audio.                            |
+| 480p                      | Best video up to 480p + best audio.                            |
+| 360p                      | Best video up to 360p + best audio.                            |
+| أقل حجم / Small           | Smallest file — `worst[ext=mp4]/worst`.                        |
+
+- A resolution button is shown **only** when that height (or a close lower
+  format) is likely available.
+- If resolution detection is limited (common on some **TikTok / Instagram**
+  links), the bot falls back to a safe set: **Full / 720p / 480p / Small**.
+- If `yt-dlp` cannot read formats at all, it says so in Arabic and still offers
+  the safe set so you can try.
+- Callback data is kept short (`v_full`, `v_1080`, `v_720`, `v_480`, `v_360`,
+  `v_small`, `audio`) to stay within Telegram's callback-length limit.
+- The 49 MB guard still applies: if the estimate looks large it warns first but
+  still tries; if the **final** file exceeds 49 MB it is not sent and the bot
+  replies `الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 720p أو 480p.`
+- The **audio (MP3)** flow is unchanged. One active download per chat still
+  applies, and large `yt-dlp` info objects are never stored in memory.
+
+The two helpers driving this are `get_available_quality_options(url)` and
+`build_video_format_selector(quality)` in [main.py](main.py).
 
 ---
 

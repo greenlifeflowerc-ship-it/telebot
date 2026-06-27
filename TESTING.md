@@ -71,8 +71,10 @@ curl "https://your-app.onrender.com/webhook-info"
 Then test the bot in Telegram:
 1. Send `/start` → Arabic welcome message.
 2. Send a public link → two buttons: **تحميل فيديو** / **تحميل صوت MP3**.
-3. Tap a button → `⏳ جاري التحميل...` then the file.
-4. Tap again while it is still downloading → `يوجد تحميل قيد التنفيذ حالياً...`.
+3. Tap **تحميل فيديو** → quality menu `اختر دقة الفيديو:` (see section 5).
+4. Pick a quality → `جاري تحميل الفيديو بالدقة المختارة...` then the file.
+5. Tap **تحميل صوت MP3** → `⏳ جاري التحميل...` then an MP3.
+6. Tap again while a download is running → `يوجد تحميل قيد التنفيذ حالياً...`.
 
 ---
 
@@ -112,3 +114,28 @@ What to verify:
 
 If a platform suddenly stops working, update `yt-dlp` by redeploying
 (Render → **Manual Deploy → Clear build cache & deploy**).
+
+---
+
+## 5. Test video quality options
+
+1. Send a public link, then tap **تحميل فيديو**.
+2. The bot replies `اختر دقة الفيديو:` with a subset of:
+   **الجودة الأصلية / Full · 1080p · 720p · 480p · 360p · أقل حجم / Small**.
+
+What to verify:
+
+| Action | Expected |
+| ------ | -------- |
+| Tap **الجودة الأصلية / Full** | Best quality, merged to mp4 (`bestvideo+bestaudio/best`). |
+| Tap **1080p / 720p / 480p / 360p** | Video capped at that height + best audio. |
+| Tap **أقل حجم / Small** | Smallest file (`worst[ext=mp4]/worst`). |
+| Pick a resolution the link cannot provide | `هذه الدقة غير متاحة لهذا الرابط. جرّب دقة أخرى.` |
+| Send a **YouTube** link (rich formats) | Menu typically shows multiple resolutions. |
+| Send a **TikTok / Instagram** link (limited formats) | Falls back to **Full / 720p / 480p / Small**. |
+| Link whose formats can't be read | `لم أستطع قراءة الدقات المتاحة، سأعرض خيارات آمنة للتجربة.` then the safe menu. |
+| Large estimate before download | `⚠️ الحجم المتوقع كبير...` warning, but it still tries. |
+| Final file > 49 MB | `الملف أكبر من حد تلغرام للبوت. جرّب دقة أقل مثل 720p أو 480p.` (not sent) — try 720p/480p. |
+
+Tip: a long 4K/1080p YouTube video is an easy way to trigger the > 49 MB path;
+a short clip is an easy way to confirm a successful send.
