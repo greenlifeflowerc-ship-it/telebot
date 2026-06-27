@@ -163,10 +163,11 @@ are logged):
 
 ```
 Video request: chat=... quality=720
-Raw download: <id>.webm (12.3 MB)
+Raw download: <title>-<id>.webm (12.3 MB)
 ffmpeg normalization ok (target_height=720)
-Normalized: normalized.mp4 (9.8 MB)
+Normalized: normalized_output.mp4 (9.8 MB)
 Sending via sendVideo
+Cleaned temp folder for chat_id=...
 ```
 
 If normalization itself fails, you get `تعذّرت معالجة الفيديو لجعله متوافقًا مع
@@ -175,3 +176,50 @@ provided by the Docker image, so this should only happen on a broken/odd source.
 
 > Local note: re-encoding needs **ffmpeg on your PATH** when running without
 > Docker. On Render it is already in the image.
+
+---
+
+## 7. Verify temporary file cleanup
+
+Downloaded media must never be left on disk after sending. Each job uses its own
+`tg_downloader_{chat_id}_…` folder in the system temp dir and deletes it in a
+`finally` block.
+
+**Watch the temp dir during a download (local).** The folder appears mid-download
+and is gone right after the bot sends the file:
+
+```bash
+# Linux/macOS — system temp is usually /tmp
+watch -n 1 'ls -d /tmp/tg_downloader_* 2>/dev/null'
+```
+
+```powershell
+# Windows PowerShell — temp is $env:TEMP
+while ($true) { Get-ChildItem $env:TEMP -Directory -Filter 'tg_downloader_*'; Start-Sleep 1; Clear-Host }
+```
+
+Run a download, then confirm:
+- A `tg_downloader_<chat_id>_*` folder exists **while** downloading/sending.
+- It is **gone** after the bot sends the file (or fails) — and the log shows
+  `Cleaned temp folder for chat_id=...`.
+- This holds for every outcome: success, bad link, ffmpeg failure, a file over
+  49 MB, and Telegram send failure.
+
+**No media in the project directory.** After several downloads, the repo folder
+should still contain only source files — no `.mp4`, `.mp3`, `.webm`, `.part`,
+`.m4a`, etc. (`.gitignore` also blocks these from ever being committed):
+
+```bash
+ls *.mp4 *.mp3 *.webm *.part 2>/dev/null   # expect: nothing
+git status --short                          # expect: clean
+```
+
+**Startup sweep.** On boot the app runs `cleanup_stale_temp_dirs()` and removes
+any `tg_downloader_*` folder older than 1 hour. To see it, create a fake stale
+folder, then restart the app:
+
+```bash
+mkdir -p "$(python -c 'import tempfile;print(tempfile.gettempdir())')/tg_downloader_test_old"
+touch -d '2 hours ago' "$(python -c 'import tempfile;print(tempfile.gettempdir())')/tg_downloader_test_old"
+# restart the app -> log: "Startup cleanup removed 1 stale temp folder(s)."
+```

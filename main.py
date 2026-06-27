@@ -25,7 +25,9 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -94,6 +96,9 @@ FALLBACK_QUALITIES: List[str] = ["full", "720", "480", "small"]
 VIDEO_QUALITY_ACTIONS: Dict[str, str] = {f"v_{key}": key for key in QUALITY_LABELS}
 # Target output height for the normalize step (None = keep original resolution).
 QUALITY_TARGET_HEIGHTS: Dict[str, int] = {"1080": 1080, "720": 720, "480": 480, "360": 360}
+
+# Prefix for every per-job temp folder; matched by the startup stale-folder sweep.
+TEMP_PREFIX = "tg_downloader_"
 
 # Per-chat memory of the last URL the user sent. In-memory only: cleared on
 # every restart / redeploy, which is fine for this simple flow.
@@ -514,6 +519,56 @@ def end_download(chat_id: int) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Temporary storage — strict per-job cleanup
+# --------------------------------------------------------------------------- #
+
+def cleanup_workdir(workdir: str | Path, chat_id: int | None = None) -> None:
+    """Delete a job's temp folder and everything inside it.
+
+    Removes raw yt-dlp downloads, the normalized MP4, the MP3 conversion,
+    thumbnails, fragments, and .part files — the whole folder. Safe to call
+    more than once and never raises.
+    """
+    shutil.rmtree(workdir, ignore_errors=True)
+    if chat_id is not None:
+        logger.info("Cleaned temp folder for chat_id=%s", chat_id)
+    else:
+        logger.info("Cleaned temp folder %s", os.path.basename(str(workdir)))
+
+
+def cleanup_stale_temp_dirs(max_age_seconds: int = 3600) -> None:
+    """Remove leftover ``tg_downloader_*`` folders older than ``max_age_seconds``.
+
+    Runs once on startup to clear anything a previous crash or restart may have
+    left in the system temp directory. Never raises.
+    """
+    temp_root = tempfile.gettempdir()
+    try:
+        entries = os.listdir(temp_root)
+    except OSError as exc:  # noqa: BLE001
+        logger.warning("Stale temp cleanup skipped (cannot list temp dir): %s", exc)
+        return
+
+    now = time.time()
+    removed = 0
+    for name in entries:
+        if not name.startswith(TEMP_PREFIX):
+            continue
+        path = os.path.join(temp_root, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age >= max_age_seconds:
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    if removed:
+        logger.info("Startup cleanup removed %d stale temp folder(s).", removed)
+
+
+# --------------------------------------------------------------------------- #
 # Downloading (yt-dlp) + normalization (ffmpeg)
 # --------------------------------------------------------------------------- #
 
@@ -529,11 +584,12 @@ def _largest_file(folder: str) -> Optional[str]:
     return max(candidates, key=os.path.getsize)
 
 
-def download_video(url: str, folder: str, quality: str = "720") -> Optional[str]:
-    """Download the raw video into `folder` using the selector for `quality`."""
+def download_video(url: str, workdir: str, quality: str = "720") -> Optional[str]:
+    """Download the raw video into `workdir` using the selector for `quality`."""
     opts: Dict[str, Any] = {
         "format": build_video_format_selector(quality),
-        "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
+        # All output (and any fragments/.part files) stays inside workdir.
+        "outtmpl": str(Path(workdir) / "%(title).80s-%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
@@ -542,7 +598,7 @@ def download_video(url: str, folder: str, quality: str = "720") -> Optional[str]
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
-    return _largest_file(folder)
+    return _largest_file(workdir)
 
 
 def normalize_video(
@@ -601,7 +657,7 @@ def _find_audio_file(folder: str) -> Optional[str]:
     return _largest_file(folder)
 
 
-def download_audio(url: str, folder: str) -> Optional[str]:
+def download_audio(url: str, workdir: str) -> Optional[str]:
     """Download the best audio and convert to MP3 (192k) via ffmpeg.
 
     Returns the resulting file path. If the MP3 conversion failed but a raw
@@ -609,7 +665,8 @@ def download_audio(url: str, folder: str) -> Optional[str]:
     """
     opts: Dict[str, Any] = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
-        "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
+        # All output (raw audio + the converted mp3) stays inside workdir.
+        "outtmpl": str(Path(workdir) / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -627,7 +684,7 @@ def download_audio(url: str, folder: str) -> Optional[str]:
             ydl.download([url])
     except Exception as exc:  # noqa: BLE001 - keep any partial audio for fallback
         logger.warning("Audio download/convert raised: %s", exc)
-    return _find_audio_file(folder)
+    return _find_audio_file(workdir)
 
 
 # --------------------------------------------------------------------------- #
@@ -647,7 +704,7 @@ def show_quality_menu(chat_id: int, url: str) -> None:
 
 
 def handle_video_request(chat_id: int, url: str, quality: str) -> None:
-    folder = tempfile.mkdtemp(prefix="dlbot_")
+    workdir = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}{chat_id}_")
     try:
         logger.info("Video request: chat=%s quality=%s", chat_id, quality)
 
@@ -658,9 +715,9 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
             logger.info("Pre-download estimate %s exceeds limit", _mb(estimate))
             send_message(chat_id, MSG_MAYBE_TOO_LARGE)
 
-        # 1) Download the raw file.
+        # 1) Download the raw file (inside workdir).
         try:
-            raw_path = download_video(url, folder, quality)
+            raw_path = download_video(url, workdir, quality)
         except DownloadError as exc:
             text = str(exc).lower()
             if "requested format" in text or "not available" in text or "no video" in text:
@@ -678,9 +735,9 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
             _mb(os.path.getsize(raw_path)),
         )
 
-        # 2) Normalize to a Telegram/mobile-compatible MP4. We never send the
-        #    raw file directly — a broken codec is the bug we are fixing.
-        normalized_path = os.path.join(folder, "normalized.mp4")
+        # 2) Normalize to a Telegram/mobile-compatible MP4 (inside workdir). We
+        #    never send the raw file directly — a broken codec is the bug.
+        normalized_path = str(Path(workdir) / "normalized_output.mp4")
         target_height = QUALITY_TARGET_HEIGHTS.get(quality)
         if not normalize_video(raw_path, normalized_path, target_height) or not os.path.exists(
             normalized_path
@@ -698,7 +755,7 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
             send_message(chat_id, MSG_TOO_LARGE_TRY_LOWER)
             return
 
-        # 4) Send as a streamable video.
+        # 4) Send as a streamable video (deleted only after this returns/fails).
         logger.info("Sending via sendVideo")
         if not send_video(chat_id, normalized_path, caption=MSG_VIDEO_DONE):
             send_message(chat_id, MSG_ERROR)
@@ -706,14 +763,14 @@ def handle_video_request(chat_id: int, url: str, quality: str) -> None:
         logger.warning("Video request failed: %s", exc)
         send_message(chat_id, MSG_ERROR)
     finally:
-        shutil.rmtree(folder, ignore_errors=True)
+        cleanup_workdir(workdir, chat_id)
 
 
 def handle_audio_request(chat_id: int, url: str) -> None:
-    folder = tempfile.mkdtemp(prefix="dlbot_")
+    workdir = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}{chat_id}_")
     try:
         logger.info("Audio request: chat=%s", chat_id)
-        path = download_audio(url, folder)
+        path = download_audio(url, workdir)
         if not path or not os.path.exists(path):
             send_message(chat_id, MSG_AUDIO_FAILED)
             return
@@ -737,7 +794,7 @@ def handle_audio_request(chat_id: int, url: str) -> None:
         logger.warning("Audio request failed: %s", exc)
         send_message(chat_id, MSG_AUDIO_FAILED)
     finally:
-        shutil.rmtree(folder, ignore_errors=True)
+        cleanup_workdir(workdir, chat_id)
 
 
 def handle_message(message: dict) -> None:
@@ -828,8 +885,9 @@ def process_update(update: dict) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Fail fast on bad configuration, then point Telegram at this service.
+    # Fail fast on bad config, sweep any old temp folders, then register.
     validate_config()
+    cleanup_stale_temp_dirs()
     register_webhook()
     yield
 

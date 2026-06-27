@@ -281,6 +281,34 @@ high-quality videos can still exceed the 49 MB bot limit even after normalizatio
 
 ---
 
+## 🧹 Temporary storage and cleanup
+
+Nothing downloaded is ever kept on the server. Each request is fully
+self-contained and its files are deleted as soon as the Telegram upload returns.
+
+- **One folder per job.** Every download creates its own unique temp folder via
+  `tempfile.mkdtemp(prefix="tg_downloader_{chat_id}_")`.
+- **Everything stays inside it.** yt-dlp output (`outtmpl`), `.part`/fragments,
+  the normalized `normalized_output.mp4`, and the MP3 conversion are all written
+  **only** inside that folder — never the project root or any persistent path.
+- **Always deleted.** A `finally` block calls
+  `cleanup_workdir(workdir, chat_id)` → `shutil.rmtree(workdir, ignore_errors=True)`,
+  so the folder is removed whether the download succeeds, the download fails,
+  ffmpeg fails, the Telegram send fails, the file is over 49 MB, or the link was
+  bad. The file is deleted **only after** the upload request returns (never
+  before), and a line like `Cleaned temp folder for chat_id=...` is logged.
+- **Startup sweep.** On boot, `cleanup_stale_temp_dirs()` removes any
+  `tg_downloader_*` folders older than 1 hour that a previous crash/restart may
+  have left in the system temp directory.
+- **No secrets in logs** — the bot token, webhook secret, and full private URLs
+  are never logged.
+
+This matters on Render because the container's disk is **ephemeral but shared
+across requests** while the instance is alive — leftover media would otherwise
+accumulate until the next redeploy.
+
+---
+
 ## Notes on architecture
 
 - **Webhook, not polling.** `run_polling()` is intentionally not used.
