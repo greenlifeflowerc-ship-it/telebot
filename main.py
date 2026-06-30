@@ -1,12 +1,17 @@
 """
-Telegram video/audio downloader bot — webhook architecture for Render Web Service.
-[INFERENCE PATCH v3.0]: Dynamic IP rotation via proxy pool + per-request browser
-impersonation and cookie injection to bypass platform blocking (Instagram empty
-media response, YouTube rate-limiting, TikTok geo-restrictions).
+Telegram video/audio downloader bot — Webhook architecture for Render.
+[FINAL v4.0] – Fully equipped to handle Instagram restrictions:
+
+- Cookies from file or browser (primary solution for empty‑media error).
+- Rotating proxy pool (bypass IP‑based rate‑limiting).
+- Platform‑specific extractor args (force web API, avoid bot detection).
+- Multiple retries with fallback to direct connection.
+- No video re‑encoding by default (stream‑copy remux, fast and lossless).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -32,6 +37,7 @@ try:
 except ImportError:
     pass
 
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -42,6 +48,7 @@ def _flag(name: str, default: bool = False) -> bool:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
+
 BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET: str = os.environ.get("WEBHOOK_SECRET", "").strip()
 DEBUG: bool = _flag("DEBUG")
@@ -51,27 +58,32 @@ FAST_MODE: bool = _flag("FAST_MODE")
 LOW_RESOURCE_MODE: bool = _flag("LOW_RESOURCE_MODE")
 SEND_VIDEO_AS_FILE_COPY: bool = _flag("SEND_VIDEO_AS_FILE_COPY")
 
-# --- DYNAMIC PROXY ROTATION ---
-# Comma-separated list of proxies: http://user:pass@host:port or socks5://host:port
+# ---------- COOKIES (the essential fix for Instagram) ----------
+# 1) Provide a path to a Netscape‑format cookies.txt (exported from your browser).
+COOKIES_FILE: str = os.environ.get("COOKIES_FILE", "").strip()
+# 2) Or let yt‑dlp extract cookies from a local browser (chrome, firefox, edge, brave, opera).
+BROWSER_COOKIES: str = os.environ.get("BROWSER_COOKIES", "").strip().lower()
+# If both are empty, the bot will still try anonymous access (will fail for private/restricted posts).
+
+# ---------- PROXY ROTATION ----------
+# Comma‑separated list of proxies: http://user:pass@host:port or socks5://host:port
 PROXY_LIST: List[str] = [p.strip() for p in os.environ.get("PROXY_LIST", "").split(",") if p.strip()]
-# If PROXY_LIST is empty, try to fetch from a proxy rotation service (e.g., http://proxy-provider.com/list)
+# Optional URL that returns a plain‑text list of proxies (one per line).
 PROXY_FETCH_URL: str = os.environ.get("PROXY_FETCH_URL", "").strip()
 PROXY_REFRESH_INTERVAL: int = int(os.environ.get("PROXY_REFRESH_INTERVAL", "600"))  # seconds
-# Force a new proxy per request (True) or reuse same proxy for a session (False)
 ROTATE_PER_REQUEST: bool = _flag("ROTATE_PER_REQUEST", default=True)
-# Fallback direct connection if proxy fails
 FALLBACK_DIRECT: bool = _flag("FALLBACK_DIRECT", default=True)
 
-# --- COOKIES & BROWSER IMPERSONATION ---
-COOKIES_FILE: str = os.environ.get("COOKIES_FILE", "").strip()
-BROWSER_COOKIES: str = os.environ.get("BROWSER_COOKIES", "").strip().lower()
-USER_AGENT: str = os.environ.get("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+# ---------- USER‑AGENT ROTATION ----------
+USER_AGENT: str = os.environ.get("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+USER_AGENTS: List[str] = [ua.strip() for ua in os.environ.get("USER_AGENTS", "").split("||") if ua.strip()]
 CUSTOM_HEADERS_JSON: str = os.environ.get("CUSTOM_HEADERS", "{}").strip()
-# Rotate User-Agent per request from a list if not fixed.
-USER_AGENTS: List[str] = [
-    ua.strip() for ua in os.environ.get("USER_AGENTS", "").split("||") if ua.strip()
-]
+
+# ---------- EXTRACTOR ARGS (force web API, avoid signature checks) ----------
 YOUTUBE_EXTRACTOR_ARGS: str = os.environ.get("YOUTUBE_EXTRACTOR_ARGS", "skip=webpage:unavailable,player:skip=configs,player:skip=webpage").strip()
+# Instagram‑specific: use the web API and add fallback to mobile.
+INSTAGRAM_EXTRACTOR_ARGS: str = os.environ.get("INSTAGRAM_EXTRACTOR_ARGS", "api=web;skip=webpage").strip()
+
 FRAGMENT_RETRIES: int = int(os.environ.get("FRAGMENT_RETRIES", "10"))
 RETRY_SLEEP: float = float(os.environ.get("RETRY_SLEEP", "1.5"))
 
@@ -81,6 +93,7 @@ ALLOWED_DOMAINS = ("youtube.com", "youtu.be", "instagram.com", "tiktok.com")
 _SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 STANDARD_HEIGHTS = (1080, 720, 480, 360, 240)
+
 ORIGINAL_SELECTOR = (
     "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
     "best[ext=mp4][vcodec^=avc1]/"
@@ -89,6 +102,7 @@ ORIGINAL_SELECTOR = (
     "bestvideo+bestaudio/best"
 )
 SMALL_SELECTOR = "worst[ext=mp4]/worst"
+
 CALLBACK_LABELS: Dict[str, str] = {
     "v_original": "الجودة الأصلية",
     "v_1080": "1080p",
@@ -113,11 +127,13 @@ _last_proxy_refresh: float = 0
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("downloader-bot")
 
+
 def _mb(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024):.1f} MB"
 
+
 # --------------------------------------------------------------------------- #
-# Messages (unchanged)
+# User messages (unchanged)
 # --------------------------------------------------------------------------- #
 MSG_WELCOME = "أرسل رابط فيديو من YouTube أو TikTok أو Instagram، وبعدها اختار فيديو أو صوت MP3."
 MSG_NOT_SUPPORTED = "❌ الرابط غير مدعوم.\nأرسل رابطًا عامًا من YouTube أو TikTok أو Instagram فقط."
@@ -142,6 +158,7 @@ MSG_AUDIO_NO_MP3 = "تم تحميل الصوت، لكن لم أستطع تحوي
 MSG_AUDIO_FAILED = "فشل تحميل الصوت. جرّب رابط آخر أو تأكد أن الرابط عام."
 MSG_ERROR = "حدث خطأ أثناء المعالجة.\nتأكد أن الرابط عام وصحيح ثم حاول مرة أخرى."
 
+
 # --------------------------------------------------------------------------- #
 # Telegram API helpers (unchanged)
 # --------------------------------------------------------------------------- #
@@ -156,17 +173,20 @@ def _api(method: str, *, timeout: int = 30, **kwargs: Any) -> Optional[dict]:
         logger.warning("Telegram %s request error: %s", method, exc)
         return None
 
+
 def send_message(chat_id: int, text: str, reply_markup: Optional[dict] = None) -> None:
     payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     _api("sendMessage", json=payload)
 
+
 def answer_callback(callback_query_id: str, text: Optional[str] = None) -> None:
     payload: Dict[str, Any] = {"callback_query_id": callback_query_id}
     if text:
         payload["text"] = text
     _api("answerCallbackQuery", json=payload)
+
 
 def send_video(chat_id: int, path: str, caption: Optional[str] = None) -> bool:
     filename = os.path.basename(path)
@@ -177,6 +197,7 @@ def send_video(chat_id: int, path: str, caption: Optional[str] = None) -> bool:
         resp = _api("sendVideo", data=data, files={"video": (filename, fh, "video/mp4")}, timeout=600)
     return bool(resp and resp.get("ok"))
 
+
 def send_document(chat_id: int, path: str, caption: Optional[str] = None) -> bool:
     filename = os.path.basename(path)
     with open(path, "rb") as fh:
@@ -186,6 +207,7 @@ def send_document(chat_id: int, path: str, caption: Optional[str] = None) -> boo
         resp = _api("sendDocument", data=data, files={"document": (filename, fh)}, timeout=600)
     return bool(resp and resp.get("ok"))
 
+
 def send_audio(chat_id: int, path: str, caption: Optional[str] = None) -> bool:
     filename = os.path.basename(path)
     with open(path, "rb") as fh:
@@ -194,6 +216,7 @@ def send_audio(chat_id: int, path: str, caption: Optional[str] = None) -> bool:
             data["caption"] = caption
         resp = _api("sendAudio", data=data, files={"audio": (filename, fh, "audio/mpeg")}, timeout=600)
     return bool(resp and resp.get("ok"))
+
 
 # --------------------------------------------------------------------------- #
 # Webhook / config (unchanged)
@@ -210,6 +233,7 @@ def public_base_url() -> str:
         return f"https://{hostname}".rstrip("/")
     return ""
 
+
 def validate_config() -> None:
     problems = []
     if not BOT_TOKEN:
@@ -225,13 +249,18 @@ def validate_config() -> None:
         logger.error(message)
         raise RuntimeError(message)
 
+
 def register_webhook() -> None:
     base = public_base_url()
     if not base:
         logger.warning("Skipping webhook registration.")
         return
     url = f"{base}/webhook/{WEBHOOK_SECRET}"
-    payload: Dict[str, Any] = {"url": url, "allowed_updates": ["message", "callback_query"], "drop_pending_updates": True}
+    payload: Dict[str, Any] = {
+        "url": url,
+        "allowed_updates": ["message", "callback_query"],
+        "drop_pending_updates": True,
+    }
     if _SECRET_TOKEN_RE.match(WEBHOOK_SECRET):
         payload["secret_token"] = WEBHOOK_SECRET
     data = _api("setWebhook", json=payload)
@@ -239,6 +268,7 @@ def register_webhook() -> None:
         logger.info("Webhook registered at %s/webhook/***", base)
     else:
         logger.error("Failed to register webhook.")
+
 
 # --------------------------------------------------------------------------- #
 # URL validation (unchanged)
@@ -248,6 +278,7 @@ def extract_url(text: str) -> Optional[str]:
     if not match:
         return None
     return match.group(0).rstrip(").,!؛،")
+
 
 def is_allowed(url: str) -> bool:
     try:
@@ -261,8 +292,10 @@ def is_allowed(url: str) -> bool:
         host = host[4:]
     return any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
 
+
 def download_keyboard() -> dict:
     return {"inline_keyboard": [[{"text": "تحميل فيديو", "callback_data": "dl_video"}, {"text": "تحميل صوت MP3", "callback_data": "audio"}]]}
+
 
 def quality_keyboard(callback_keys: List[str]) -> dict:
     rows: List[List[dict]] = []
@@ -280,11 +313,11 @@ def quality_keyboard(callback_keys: List[str]) -> dict:
         rows.append(row)
     return {"inline_keyboard": rows}
 
+
 # --------------------------------------------------------------------------- #
 # PROXY POOL MANAGEMENT
 # --------------------------------------------------------------------------- #
 def _refresh_proxy_pool() -> None:
-    """Fetch fresh proxies from PROXY_FETCH_URL if defined, else use static list."""
     global _proxy_pool, _last_proxy_refresh
     now = time.time()
     if now - _last_proxy_refresh < PROXY_REFRESH_INTERVAL and _proxy_pool:
@@ -296,7 +329,6 @@ def _refresh_proxy_pool() -> None:
         try:
             resp = requests.get(PROXY_FETCH_URL, timeout=10)
             if resp.status_code == 200:
-                # Assume plain text list, one proxy per line.
                 fetched = [line.strip() for line in resp.text.splitlines() if line.strip()]
                 new_proxies.extend(fetched)
                 logger.info("Fetched %d proxies from %s", len(fetched), PROXY_FETCH_URL)
@@ -310,22 +342,23 @@ def _refresh_proxy_pool() -> None:
         else:
             logger.warning("No proxies available; will use direct connection if fallback enabled.")
 
+
 def _get_proxy() -> Optional[str]:
-    """Return a random proxy from the pool, or None if pool empty."""
     _refresh_proxy_pool()
     with _proxy_lock:
         if not _proxy_pool:
             return None
         return random.choice(_proxy_pool)
 
+
 def _get_user_agent() -> str:
-    """Return a user-agent, rotating if a list is provided."""
     if USER_AGENTS:
         return random.choice(USER_AGENTS)
     return USER_AGENT
 
+
 # --------------------------------------------------------------------------- #
-# Quality detection with proxy/UA rotation
+# Quality detection with full evasion
 # --------------------------------------------------------------------------- #
 def _selector_for_height(height: int) -> str:
     return (
@@ -335,11 +368,13 @@ def _selector_for_height(height: int) -> str:
         f"best[height<={height}]"
     )
 
+
 def _height_from_key(callback: str) -> int:
     try:
         return int(callback.split("_")[1])
     except (IndexError, ValueError):
         return 720
+
 
 def _selector_from_callback(callback: str) -> str:
     if callback == "v_original":
@@ -348,12 +383,14 @@ def _selector_from_callback(callback: str) -> str:
         return SMALL_SELECTOR
     return _selector_for_height(_height_from_key(callback))
 
+
 def _fallback_selectors() -> Dict[str, str]:
     options: Dict[str, str] = {"v_original": ORIGINAL_SELECTOR}
     for height in (720, 480, 360):
         options[f"v_{height}"] = _selector_for_height(height)
     options["v_small"] = SMALL_SELECTOR
     return options
+
 
 def _build_evasion_headers() -> Dict[str, str]:
     headers = {
@@ -370,20 +407,24 @@ def _build_evasion_headers() -> Dict[str, str]:
     }
     if CUSTOM_HEADERS_JSON:
         try:
-            import json
             custom = json.loads(CUSTOM_HEADERS_JSON)
             headers.update(custom)
         except Exception:
             logger.warning("Invalid CUSTOM_HEADERS_JSON, ignoring.")
     return headers
 
+
 def _apply_cookie_plugin(ydl_opts: Dict[str, Any]) -> None:
+    """Inject cookies – the primary fix for Instagram’s empty‑media response."""
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
         logger.info("Using cookiefile: %s", COOKIES_FILE)
     elif BROWSER_COOKIES and BROWSER_COOKIES in ("chrome", "firefox", "edge", "brave", "opera"):
         ydl_opts["cookiesfrombrowser"] = (BROWSER_COOKIES,)
         logger.info("Using browser cookies: %s", BROWSER_COOKIES)
+    else:
+        logger.warning("No cookies provided – Instagram private/restricted posts will fail.")
+
 
 def _build_base_ydl_opts(workdir: str, proxy: Optional[str] = None) -> Dict[str, Any]:
     opts = {
@@ -407,35 +448,50 @@ def _build_base_ydl_opts(workdir: str, proxy: Optional[str] = None) -> Dict[str,
     }
     if proxy:
         opts["proxy"] = proxy
+        # Log only the host:port part for privacy.
         logger.info("Using proxy: %s", proxy.split("@")[-1] if "@" in proxy else proxy)
+
+    # YouTube extractor args.
     if YOUTUBE_EXTRACTOR_ARGS:
-        opts["extractor_args"] = {
-            "youtube": {
-                "skip": YOUTUBE_EXTRACTOR_ARGS.split(","),
-                "player_client": ["android", "web"],
-                "player_skip": ["configs", "webpage"],
-            }
+        opts.setdefault("extractor_args", {})["youtube"] = {
+            "skip": YOUTUBE_EXTRACTOR_ARGS.split(","),
+            "player_client": ["android", "web"],
+            "player_skip": ["configs", "webpage"],
         }
+
+    # Instagram extractor args – force web API and skip webpage parsing.
+    if INSTAGRAM_EXTRACTOR_ARGS:
+        opts.setdefault("extractor_args", {})["instagram"] = {}
+        for arg in INSTAGRAM_EXTRACTOR_ARGS.split(";"):
+            if "=" in arg:
+                key, val = arg.split("=", 1)
+                opts["extractor_args"]["instagram"][key] = val.split(",")
+            else:
+                opts["extractor_args"]["instagram"][arg] = True
+
     _apply_cookie_plugin(opts)
     return opts
 
+
 def analyze_video_qualities(url: str) -> Optional[Dict[str, str]]:
-    # Try with a random proxy first, fallback direct if enabled.
-    proxies_attempted = []
+    """Analyze with full evasion stack (cookies + proxy + UA rotation)."""
+    proxies_to_try = []
     if ROTATE_PER_REQUEST:
-        proxy = _get_proxy()
-        if proxy:
-            proxies_attempted.append(proxy)
+        for _ in range(3):
+            p = _get_proxy()
+            if p and p not in proxies_to_try:
+                proxies_to_try.append(p)
+        if FALLBACK_DIRECT:
+            proxies_to_try.append(None)
     else:
-        # Use a fixed proxy for the session if available.
         with _proxy_lock:
             if _proxy_pool:
-                proxy = _proxy_pool[0]  # or pick one
-                proxies_attempted.append(proxy)
-    if not proxies_attempted and FALLBACK_DIRECT:
-        proxies_attempted.append(None)  # direct
+                proxies_to_try.append(_proxy_pool[0])
+        if FALLBACK_DIRECT:
+            proxies_to_try.append(None)
 
-    for proxy in proxies_attempted:
+    info = None
+    for proxy in proxies_to_try:
         try:
             opts = _build_base_ydl_opts(tempfile.mkdtemp(prefix=TEMP_PREFIX), proxy=proxy)
             opts["skip_download"] = True
@@ -446,12 +502,10 @@ def analyze_video_qualities(url: str) -> Optional[Dict[str, str]]:
         except Exception as exc:
             logger.warning("Quality analysis with proxy %s failed: %s", proxy, exc)
             continue
-    else:
+    if not info:
         logger.error("All proxy attempts failed for quality analysis.")
         return None
 
-    if not info:
-        return None
     video_formats = [f for f in (info.get("formats") or []) if f.get("vcodec") not in (None, "none")]
     heights = sorted({int(f["height"]) for f in video_formats if f.get("height")})
     if not heights and info.get("height"):
@@ -468,6 +522,7 @@ def analyze_video_qualities(url: str) -> Optional[Dict[str, str]]:
     options["v_small"] = SMALL_SELECTOR
     return options
 
+
 # --------------------------------------------------------------------------- #
 # Concurrency / temp cleanup (unchanged)
 # --------------------------------------------------------------------------- #
@@ -482,11 +537,13 @@ def try_begin_download(chat_id: int) -> tuple[bool, Optional[str]]:
         _global_job_active = True
         return True, None
 
+
 def end_download(chat_id: int) -> None:
     global _global_job_active
     with _downloads_lock:
         active_downloads.discard(chat_id)
         _global_job_active = False
+
 
 def cleanup_workdir(workdir: str | Path, chat_id: int | None = None) -> None:
     shutil.rmtree(workdir, ignore_errors=True)
@@ -494,6 +551,7 @@ def cleanup_workdir(workdir: str | Path, chat_id: int | None = None) -> None:
         logger.info("Cleaned temp folder for chat_id=%s", chat_id)
     else:
         logger.info("Cleaned temp folder %s", os.path.basename(str(workdir)))
+
 
 def cleanup_stale_temp_dirs(max_age_seconds: int = 3600) -> None:
     temp_root = tempfile.gettempdir()
@@ -520,8 +578,9 @@ def cleanup_stale_temp_dirs(max_age_seconds: int = 3600) -> None:
     if removed:
         logger.info("Startup cleanup removed %d stale temp folder(s).", removed)
 
+
 # --------------------------------------------------------------------------- #
-# Download with proxy rotation and retry
+# Download with full retry logic (proxy + cookies)
 # --------------------------------------------------------------------------- #
 def _largest_file(folder: str) -> Optional[str]:
     candidates = [os.path.join(folder, name) for name in os.listdir(folder) if os.path.isfile(os.path.join(folder, name))]
@@ -529,12 +588,12 @@ def _largest_file(folder: str) -> Optional[str]:
         return None
     return max(candidates, key=os.path.getsize)
 
-def _download_with_retry(url: str, workdir: str, opts_builder, max_retries: int = 3) -> Optional[str]:
-    """Attempt download with different proxies and UA rotation on failure."""
+
+def _download_with_retry(url: str, workdir: str, opts_builder, max_retries: int = 5) -> Optional[str]:
+    """Try multiple proxies, falling back to direct connection, with UA rotation."""
     proxies_to_try = []
     if ROTATE_PER_REQUEST:
-        # Try up to 5 different proxies.
-        for _ in range(5):
+        for _ in range(max_retries):
             p = _get_proxy()
             if p and p not in proxies_to_try:
                 proxies_to_try.append(p)
@@ -547,6 +606,10 @@ def _download_with_retry(url: str, workdir: str, opts_builder, max_retries: int 
         if FALLBACK_DIRECT:
             proxies_to_try.append(None)
 
+    # If no proxies at all, ensure at least direct is tried.
+    if not proxies_to_try:
+        proxies_to_try.append(None)
+
     for attempt, proxy in enumerate(proxies_to_try[:max_retries]):
         try:
             opts = opts_builder(workdir, proxy)
@@ -556,16 +619,19 @@ def _download_with_retry(url: str, workdir: str, opts_builder, max_retries: int 
             if result:
                 return result
         except DownloadError as exc:
-            logger.warning("Download attempt %d with proxy %s failed: %s", attempt+1, proxy, exc)
-            # If we have more proxies, continue; else break.
+            logger.warning("Download attempt %d with proxy %s failed: %s", attempt + 1, proxy, exc)
+            # If the error mentions cookies or auth, we should stop retrying and inform.
+            if "empty media" in str(exc).lower() or "cookies" in str(exc).lower():
+                logger.error("Instagram requires cookies – provide COOKIES_FILE or BROWSER_COOKIES.")
+                break  # No point retrying without cookies.
             continue
         except Exception as exc:
-            logger.warning("Unexpected error on attempt %d: %s", attempt+1, exc)
+            logger.warning("Unexpected error on attempt %d: %s", attempt + 1, exc)
             continue
     return None
 
+
 def download_video(url: str, workdir: str, selector: str) -> Optional[str]:
-    """Download with proxy rotation and fallback."""
     def builder(workdir, proxy):
         opts = _build_base_ydl_opts(workdir, proxy)
         opts["format"] = selector
@@ -573,11 +639,18 @@ def download_video(url: str, workdir: str, selector: str) -> Optional[str]:
         return opts
     return _download_with_retry(url, workdir, builder, max_retries=5)
 
+
 def _run_ffmpeg(cmd: List[str], output_path: str) -> bool:
     log_path = output_path + ".log"
     try:
         with open(log_path, "wb") as errlog:
-            result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errlog, timeout=600)
+            result = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=errlog,
+                timeout=600,
+            )
     except FileNotFoundError:
         logger.error("ffmpeg not found on PATH.")
         return False
@@ -595,22 +668,42 @@ def _run_ffmpeg(cmd: List[str], output_path: str) -> bool:
         return False
     return True
 
+
 def remux_video(input_path: str, output_path: str) -> bool:
-    cmd = ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", input_path, "-c", "copy", "-movflags", "+faststart", output_path]
+    cmd = [
+        "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", input_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        output_path,
+    ]
     ok = _run_ffmpeg(cmd, output_path)
     if ok:
         logger.info("remux ok (stream copy)")
     return ok
 
+
 def normalize_video(input_path: str, output_path: str, target_height: Optional[int] = None, crf: int = 30, audio_bitrate: str = "96k") -> bool:
-    cmd = ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1", "-i", input_path, "-map", "0:v:0", "-map", "0:a?"]
+    cmd = [
+        "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-threads", "1",
+        "-i", input_path,
+        "-map", "0:v:0", "-map", "0:a?",
+    ]
     if target_height:
         cmd += ["-vf", f"scale=-2:min({target_height}\\,ih)"]
-    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-profile:v", "main", "-pix_fmt", "yuv420p", "-crf", str(crf), "-c:a", "aac", "-b:a", audio_bitrate, "-movflags", "+faststart", output_path]
+    cmd += [
+        "-c:v", "libx264", "-preset", "ultrafast", "-profile:v", "main",
+        "-pix_fmt", "yuv420p", "-crf", str(crf),
+        "-c:a", "aac", "-b:a", audio_bitrate,
+        "-movflags", "+faststart",
+        output_path,
+    ]
     ok = _run_ffmpeg(cmd, output_path)
     if ok:
         logger.info("ffmpeg re-encode ok")
     return ok
+
 
 def _reencode_params(quality_key: str) -> tuple[Optional[int], int, str]:
     if quality_key == "v_original":
@@ -621,6 +714,7 @@ def _reencode_params(quality_key: str) -> tuple[Optional[int], int, str]:
     if LOW_RESOURCE_MODE:
         height = min(height, 720)
     return height, 30, "96k"
+
 
 def _find_audio_file(folder: str) -> Optional[str]:
     names = os.listdir(folder)
@@ -633,6 +727,7 @@ def _find_audio_file(folder: str) -> Optional[str]:
                 return os.path.join(folder, name)
     return _largest_file(folder)
 
+
 def download_audio(url: str, workdir: str) -> Optional[str]:
     def builder(workdir, proxy):
         opts = _build_base_ydl_opts(workdir, proxy)
@@ -642,11 +737,11 @@ def download_audio(url: str, workdir: str) -> Optional[str]:
     result = _download_with_retry(url, workdir, builder, max_retries=5)
     if result:
         return result
-    # Fallback: try direct without proxy if not already attempted.
-    return _find_audio_file(workdir)
+    return _find_audio_file(workdir)  # final fallback
+
 
 # --------------------------------------------------------------------------- #
-# Handlers (unchanged logic, just using patched downloads)
+# Handlers (using the enhanced download functions)
 # --------------------------------------------------------------------------- #
 def show_quality_menu(chat_id: int, url: str) -> None:
     options = analyze_video_qualities(url)
@@ -659,6 +754,7 @@ def show_quality_menu(chat_id: int, url: str) -> None:
     last_selectors_by_chat[chat_id] = options
     send_message(chat_id, MSG_VIDEO_QUALITY_MENU, reply_markup=quality_keyboard(list(options.keys())))
 
+
 def handle_video_request(chat_id: int, url: str, quality_key: str, selector: str) -> None:
     workdir = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}{chat_id}_")
     try:
@@ -669,11 +765,13 @@ def handle_video_request(chat_id: int, url: str, quality_key: str, selector: str
             send_message(chat_id, MSG_NOT_DIRECT)
             return
         logger.info("yt-dlp download: %.1fs -> %s (%s)", time.monotonic() - dl_start, os.path.basename(raw_path), _mb(os.path.getsize(raw_path)))
+
         is_mp4 = raw_path.lower().endswith(".mp4")
         output_path = str(Path(workdir) / "video_output.mp4")
         proc_start = time.monotonic()
         method = "direct"
         final_path: Optional[str] = None
+
         if is_mp4 and FAST_MODE:
             final_path = raw_path
         else:
@@ -691,15 +789,18 @@ def handle_video_request(chat_id: int, url: str, quality_key: str, selector: str
             else:
                 send_message(chat_id, MSG_REMUX_FAILED)
                 return
+
         if not final_path or not os.path.exists(final_path):
             send_message(chat_id, MSG_REMUX_FAILED)
             return
         logger.info("%s: %.1fs", method, time.monotonic() - proc_start)
+
         final_size = os.path.getsize(final_path)
         logger.info("Final file: %s (%s) method=%s", os.path.basename(final_path), _mb(final_size), method)
         if final_size > MAX_FILE_SIZE:
             send_message(chat_id, MSG_TOO_LARGE_ORIGINAL)
             return
+
         send_message(chat_id, MSG_SENDING_VIDEO)
         up_start = time.monotonic()
         sent = send_video(chat_id, final_path, caption=MSG_VIDEO_DONE_ORIGINAL)
@@ -714,6 +815,7 @@ def handle_video_request(chat_id: int, url: str, quality_key: str, selector: str
         send_message(chat_id, MSG_ERROR)
     finally:
         cleanup_workdir(workdir, chat_id)
+
 
 def handle_audio_request(chat_id: int, url: str) -> None:
     workdir = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}{chat_id}_")
@@ -745,6 +847,7 @@ def handle_audio_request(chat_id: int, url: str) -> None:
     finally:
         cleanup_workdir(workdir, chat_id)
 
+
 def handle_message(message: dict) -> None:
     chat_id = message["chat"]["id"]
     text = (message.get("text") or "").strip()
@@ -761,6 +864,7 @@ def handle_message(message: dict) -> None:
     last_selectors_by_chat.pop(chat_id, None)
     send_message(chat_id, MSG_CHOOSE, reply_markup=download_keyboard())
 
+
 def _run_guarded_download(chat_id: int, status_msg: str, work) -> None:
     ok, reason = try_begin_download(chat_id)
     if not ok:
@@ -771,6 +875,7 @@ def _run_guarded_download(chat_id: int, status_msg: str, work) -> None:
         work()
     finally:
         end_download(chat_id)
+
 
 def handle_callback(callback: dict) -> None:
     answer_callback(callback["id"])
@@ -794,6 +899,7 @@ def handle_callback(callback: dict) -> None:
         _run_guarded_download(chat_id, MSG_DOWNLOADING, lambda: handle_audio_request(chat_id, url))
         return
 
+
 def process_update(update: dict) -> None:
     try:
         if "message" in update:
@@ -803,6 +909,7 @@ def process_update(update: dict) -> None:
     except Exception as exc:
         logger.warning("process_update error: %s", exc)
 
+
 # --------------------------------------------------------------------------- #
 # FastAPI application
 # --------------------------------------------------------------------------- #
@@ -811,20 +918,26 @@ async def lifespan(_: FastAPI):
     validate_config()
     cleanup_stale_temp_dirs()
     _refresh_proxy_pool()
-    logger.info("Flags: NO_VIDEO_COMPRESSION=%s FAST_MODE=%s NO_REENCODE_BY_DEFAULT=%s SEND_VIDEO_AS_FILE_COPY=%s", NO_VIDEO_COMPRESSION, FAST_MODE, NO_REENCODE_BY_DEFAULT, SEND_VIDEO_AS_FILE_COPY)
+    logger.info("Flags: NO_VIDEO_COMPRESSION=%s FAST_MODE=%s NO_REENCODE_BY_DEFAULT=%s SEND_VIDEO_AS_FILE_COPY=%s",
+                NO_VIDEO_COMPRESSION, FAST_MODE, NO_REENCODE_BY_DEFAULT, SEND_VIDEO_AS_FILE_COPY)
     logger.info("Proxy pool size: %d, rotate per request: %s", len(_proxy_pool), ROTATE_PER_REQUEST)
+    logger.info("Cookies: file=%s, browser=%s", bool(COOKIES_FILE), BROWSER_COOKIES)
     register_webhook()
     yield
 
+
 app = FastAPI(title="Telegram Downloader Bot", lifespan=lifespan)
+
 
 @app.get("/")
 def root() -> dict:
     return {"status": "ok"}
 
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "status": "healthy"}
+
 
 @app.get("/webhook-info")
 def webhook_info() -> dict:
@@ -837,6 +950,7 @@ def webhook_info() -> dict:
     if WEBHOOK_SECRET and isinstance(result.get("url"), str):
         result["url"] = result["url"].replace(WEBHOOK_SECRET, "***")
     return {"ok": bool(data.get("ok")), "result": result}
+
 
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request, background_tasks: BackgroundTasks) -> dict:
