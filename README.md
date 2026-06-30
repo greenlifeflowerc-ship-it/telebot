@@ -36,6 +36,39 @@ without authentication.
 
 ---
 
+## 🔓 "Download-disabled" public videos (what it can and can't do)
+
+A common question: *"can it download a TikTok/Instagram/YouTube video where the
+download button is off?"* Yes — because that toggle is **not** an access lock:
+
+- The platform's "**allow download**" / save toggle only controls the **in-app
+  save button**. It does **not** gate the public video stream. If the video is
+  **public** (plays in a logged-out browser), the bot downloads it normally —
+  the disabled toggle is irrelevant.
+- The real reasons a *public* link sometimes fails are **anti-bot 403s** and
+  **extractor breakage**, not the toggle. The bot handles these legitimately:
+  - **Browser impersonation** (`IMPERSONATE=true`, via `curl_cffi`) makes the
+    request look like a normal browser so anti-bot layers don't 403 public
+    content. This is fingerprint matching, **not** login/DRM/geo bypass.
+  - **Resilient retries** (`retries`/`extractor_retries`/`fragment_retries`) and
+    a real User-Agent ride out transient failures and rate-limits.
+  - Keep **`yt-dlp` fresh** (it's unpinned; redeploy with *Clear build cache*).
+
+It still will **not** bypass genuine access controls — and instead of failing
+silently, it tells you the real reason in Arabic:
+
+| Situation | The bot replies (Arabic), and does NOT bypass it |
+| --------- | ------------------------------------------------- |
+| Private / login-required | "هذا المحتوى خاص أو يتطلب تسجيل دخول…" |
+| YouTube "confirm you're not a bot" | "المنصّة تطلب تسجيل دخول للتأكد أنك لست روبوتاً…" |
+| Age-restricted (needs login) | "هذا المحتوى مقيّد بالعمر…" |
+| Members-only / paid | "هذا المحتوى حصري للأعضاء/المشتركين…" |
+| DRM-protected | "هذا المحتوى محمي بحقوق رقمية (DRM)…" |
+| Geo-blocked | "هذا المحتوى محجوب جغرافياً…" |
+| Temporary / extractor break | "تعذّر التنزيل مؤقتاً… أعد المحاولة / حدّث yt-dlp" |
+
+---
+
 ## 📁 Project structure
 
 | File               | Purpose                                            |
@@ -80,6 +113,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 | `NO_REENCODE_BY_DEFAULT`  | Optional | **Default `true`.** Kept for the opt-in fallback; a re-encode runs only if this **and** `NO_VIDEO_COMPRESSION` are `false`. |
 | `FAST_MODE`               | Optional | `true` sends an already-MP4 file directly (no ffmpeg); `false` fast stream-copy remuxes it. |
 | `SEND_VIDEO_AS_FILE_COPY` | Optional | Default `false`. Keep `false` — the bot sends each video only once via `sendVideo`. |
+| `IMPERSONATE`             | Optional | **Default `true`.** Make PUBLIC requests look like a real browser so anti-bot 403s don't block legitimate public downloads. Not login/DRM/geo bypass. Needs `curl_cffi`. |
 | `LOW_RESOURCE_MODE`       | Optional | Only affects the rare opt-in re-encode fallback (height cap). Not needed for normal use. |
 | `RENDER_EXTERNAL_URL`     | Auto     | Injected by Render (when available) — **do not set manually**.              |
 | `RENDER_EXTERNAL_HOSTNAME`| Auto     | Render's standard host var — the app builds `https://{hostname}` from it. **Do not set manually**. |

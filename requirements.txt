@@ -10,5 +10,10 @@ requests>=2.31.0
 # latest. Pin a version here only if you need fully reproducible builds.
 yt-dlp
 
+# Enables yt-dlp browser impersonation (TLS/HTTP fingerprint) so PUBLIC videos
+# behind anti-bot 403s still download. NOT used for login/DRM/geo bypass.
+# Optional: the bot degrades gracefully (no impersonation) if this is missing.
+curl_cffi>=0.7.0
+
 # Loads a local .env during development (ignored on Render, which injects env vars)
 python-dotenv>=1.0.0

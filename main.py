@@ -82,6 +82,12 @@ LOW_RESOURCE_MODE: bool = _flag("LOW_RESOURCE_MODE")
 # Optionally ALSO send the video as a document copy. Off by default.
 SEND_VIDEO_AS_FILE_COPY: bool = _flag("SEND_VIDEO_AS_FILE_COPY")
 
+# Make PUBLIC requests look like a real browser (TLS/UA fingerprint) so platform
+# anti-bot layers don't 403 legitimate public downloads. This is fingerprint
+# matching for already-public content — NOT cookies, login, DRM, or geo bypass.
+# Best-effort: silently skipped if curl_cffi isn't installed.
+IMPERSONATE: bool = _flag("IMPERSONATE", default=True)
+
 # Telegram Bot API practical upload limit for bots is 50 MB; stay just under it.
 MAX_FILE_SIZE: int = 49 * 1024 * 1024  # 49 MB in bytes
 
@@ -205,6 +211,88 @@ MSG_ERROR = (
     "حدث خطأ أثناء المعالجة.\n"
     "تأكد أن الرابط عام وصحيح ثم حاول مرة أخرى."
 )
+
+# Clear reasons a download legitimately can't proceed (shown instead of a
+# generic error). We never bypass these — we explain them.
+MSG_LOCK_PRIVATE = (
+    "هذا المحتوى خاص أو يتطلب تسجيل دخول، فلا يمكن تنزيله. "
+    "(البوت ينزّل المحتوى العام فقط.)"
+)
+MSG_LOCK_BOTCHECK = (
+    "المنصّة تطلب تسجيل دخول للتأكد أنك لست روبوتاً (غالباً بسبب عنوان السيرفر). "
+    "جرّب لاحقاً — لا يمكننا تجاوز هذا التحقق."
+)
+MSG_LOCK_AGE = (
+    "هذا المحتوى مقيّد بالعمر ويتطلب حساباً مسجّلاً ومتحقّقاً من العمر، فلا يمكن تنزيله."
+)
+MSG_LOCK_MEMBERS = "هذا المحتوى حصري للأعضاء/المشتركين، ولا يمكن تنزيله دون عضوية."
+MSG_LOCK_DRM = "هذا المحتوى محمي بحقوق رقمية (DRM) ولا يمكن تنزيله."
+MSG_LOCK_GEO = "هذا المحتوى محجوب جغرافياً في منطقة السيرفر، ولا يمكننا تجاوز القيد."
+MSG_UNAVAILABLE = "هذا الفيديو غير متاح (قد يكون محذوفاً أو لم يُنشر بعد). تأكد من الرابط."
+MSG_TEMP_FAIL = (
+    "تعذّر التنزيل مؤقتاً (قد يكون المصدر غيّر شيئاً أو هناك ضغط مؤقت). "
+    "أعد المحاولة بعد قليل، وإذا تكرّر أعد النشر مع تحديث yt-dlp."
+)
+
+# Ordered (FIRST MATCH WINS) lowercased yt-dlp error fragment -> Arabic reason.
+# Specific "genuinely locked" cases first; transient/extractor breakage last.
+_ERROR_RULES: List[tuple] = [
+    ("confirm your age", MSG_LOCK_AGE),
+    ("comfortable for some audiences", MSG_LOCK_AGE),
+    ("age-restricted", MSG_LOCK_AGE),
+    ("age restricted", MSG_LOCK_AGE),
+    ("not a bot", MSG_LOCK_BOTCHECK),
+    # Instagram's ambiguous message is usually a transient rate-limit, not auth:
+    ("requested content is not available", MSG_TEMP_FAIL),
+    ("join this channel to get access", MSG_LOCK_MEMBERS),
+    ("members-only", MSG_LOCK_MEMBERS),
+    ("members only", MSG_LOCK_MEMBERS),
+    ("drm protected", MSG_LOCK_DRM),
+    ("drm-protected", MSG_LOCK_DRM),
+    ("this video is drm", MSG_LOCK_DRM),
+    ("account is private", MSG_LOCK_PRIVATE),
+    ("requiring login for access", MSG_LOCK_PRIVATE),
+    ("do not have permission to view", MSG_LOCK_PRIVATE),
+    ("this video is private", MSG_LOCK_PRIVATE),
+    ("log into an account", MSG_LOCK_PRIVATE),
+    ("you need to log in", MSG_LOCK_PRIVATE),
+    ("log in for access", MSG_LOCK_PRIVATE),
+    ("login required", MSG_LOCK_PRIVATE),
+    ("ip address is blocked", MSG_LOCK_GEO),
+    ("status code 10204", MSG_LOCK_GEO),
+    ("not available in your country", MSG_LOCK_GEO),
+    ("available in your country", MSG_LOCK_GEO),
+    ("not available in your region", MSG_LOCK_GEO),
+    ("video is unavailable", MSG_UNAVAILABLE),
+    ("video unavailable", MSG_UNAVAILABLE),
+    ("no longer available", MSG_UNAVAILABLE),
+    ("has been removed", MSG_UNAVAILABLE),
+    ("premieres in", MSG_UNAVAILABLE),
+    ("live event will begin", MSG_UNAVAILABLE),
+    ("livestream has ended", MSG_UNAVAILABLE),
+    # Transient / extractor breakage (retryable, NO auth needed) — checked last:
+    ("rate-limit reached", MSG_TEMP_FAIL),
+    ("rate limit", MSG_TEMP_FAIL),
+    ("http error 429", MSG_TEMP_FAIL),
+    ("http error 403", MSG_TEMP_FAIL),
+    ("403: forbidden", MSG_TEMP_FAIL),
+    ("unable to extract", MSG_TEMP_FAIL),
+    ("unable to download webpage", MSG_TEMP_FAIL),
+    ("nsig", MSG_TEMP_FAIL),
+    ("incomplete data received", MSG_TEMP_FAIL),
+    ("fresh cookies", MSG_TEMP_FAIL),
+    ("no working app info", MSG_TEMP_FAIL),
+    ("unable to solve js challenge", MSG_TEMP_FAIL),
+    ("temporarily", MSG_TEMP_FAIL),
+]
+
+
+def classify_download_error(text_lower: str) -> Optional[str]:
+    """Map a yt-dlp error (already lowercased) to a clear Arabic reason, or None."""
+    for fragment, message in _ERROR_RULES:
+        if fragment in text_lower:
+            return message
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -578,7 +666,11 @@ def cleanup_stale_temp_dirs(max_age_seconds: int = 3600) -> None:
 # --------------------------------------------------------------------------- #
 
 def _base_ydl_opts(workdir: str) -> Dict[str, Any]:
-    """Shared yt-dlp options: everything stays in workdir; original quality."""
+    """Shared yt-dlp options: everything stays in workdir; original quality.
+
+    Includes resilience options for flaky PUBLIC extraction (retries + a normal
+    browser User-Agent). None of these are auth/cookies/DRM/geo bypass.
+    """
     return {
         "outtmpl": str(Path(workdir) / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
@@ -586,30 +678,83 @@ def _base_ydl_opts(workdir: str) -> Dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "cachedir": False,
-        "retries": 2,
+        # Retry transient network / extractor / fragment failures (public content).
+        "retries": 10,
+        "extractor_retries": 3,
+        "fragment_retries": 10,
+        "file_access_retries": 3,
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 1,
+        # Present a normal desktop-browser User-Agent for public requests.
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+        },
     }
 
 
+_SKIP_EXTS = (".part", ".ytdl", ".tmp", ".temp", ".log")
+
+
 def _largest_file(folder: str) -> Optional[str]:
-    """Return the largest regular file in a folder (the media output)."""
+    """Return the largest finished media file in a folder.
+
+    Ignores partial/temp files (.part/.ytdl/...) so a failed/aborted download is
+    never picked up and sent.
+    """
     candidates = [
         os.path.join(folder, name)
         for name in os.listdir(folder)
         if os.path.isfile(os.path.join(folder, name))
+        and not name.lower().endswith(_SKIP_EXTS)
     ]
     if not candidates:
         return None
     return max(candidates, key=os.path.getsize)
 
 
+def _impersonate_target():
+    """yt-dlp ImpersonateTarget for browser fingerprinting on PUBLIC content, or
+    None when disabled/unavailable. This is NOT cookies/login/DRM/geo bypass —
+    it only makes a legitimate public request look like a normal browser so
+    anti-bot layers don't 403 it."""
+    if not IMPERSONATE:
+        return None
+    try:
+        import curl_cffi  # noqa: F401 - provides the impersonation backend
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+
+        return ImpersonateTarget("chrome")
+    except Exception:  # noqa: BLE001 - any issue -> just skip impersonation
+        return None
+
+
 def download_video(url: str, workdir: str, selector: str) -> Optional[str]:
     """Download the raw video into `workdir`. Separate streams are merged with a
-    stream copy into MP4 (merge_output_format), never re-encoded."""
+    stream copy into MP4 (merge_output_format), never re-encoded.
+
+    Tries browser impersonation first (helps PUBLIC videos that anti-bot 403s),
+    then falls back to a plain request so genuine errors still surface.
+    """
     opts = _base_ydl_opts(workdir)
     opts["format"] = selector
     opts["merge_output_format"] = "mp4"
+
+    target = _impersonate_target()
+    if target is not None:
+        try:
+            impersonated = dict(opts)
+            impersonated["impersonate"] = target
+            # Let the impersonation backend set matching browser headers itself.
+            impersonated.pop("http_headers", None)
+            with yt_dlp.YoutubeDL(impersonated) as ydl:
+                ydl.download([url])
+            return _largest_file(workdir)
+        except Exception as exc:  # noqa: BLE001 - retry plainly below
+            logger.info("Impersonated attempt failed (%s); retrying plainly.", str(exc)[:200])
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
     return _largest_file(workdir)
@@ -775,11 +920,12 @@ def handle_video_request(chat_id: int, url: str, quality_key: str, selector: str
             raw_path = download_video(url, workdir, selector)
         except DownloadError as exc:
             text = str(exc).lower()
-            if "requested format" in text or "not available" in text or "no video" in text:
+            logger.warning("Video download error: %s", str(exc)[:300])
+            if "requested format" in text or "no video formats" in text:
                 send_message(chat_id, MSG_NOT_DIRECT)
             else:
-                logger.warning("Video download error: %s", exc)
-                send_message(chat_id, MSG_ERROR)
+                # Explain the real reason (private / age / DRM / geo / temporary).
+                send_message(chat_id, classify_download_error(text) or MSG_ERROR)
             return
         if not raw_path or not os.path.exists(raw_path):
             send_message(chat_id, MSG_NOT_DIRECT)

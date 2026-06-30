@@ -261,3 +261,31 @@ appear (after `جاري ضغط الفيديو...`).
 
 `FAST_MODE=false` swaps direct-send for a stream-copy remux (still no re-encode)
 — handy to compare `method=direct` vs `method=remux` timings.
+
+---
+
+## 9. Verify "download-disabled" public videos + locked-content messages
+
+The bot should download PUBLIC videos even when the platform's in-app download
+button is OFF, and clearly explain genuinely-locked content (without bypassing).
+
+Setup: keep `IMPERSONATE=true` and make sure `curl_cffi` installed (it's in
+`requirements.txt`). On startup, impersonation is best-effort — if `curl_cffi`
+is missing the bot still runs, just without it.
+
+What to verify:
+
+| Test | Expected |
+| ---- | -------- |
+| A **public** TikTok with "Allow download" turned OFF | Downloads normally (the toggle is not an access lock). Logs show `method=direct`/`remux`. |
+| A **public** Instagram reel (no native download button) | Downloads; if it intermittently rate-limits, the retries help; persistent failure → `…rate limit…` message. |
+| A **public** YouTube video | Downloads. (No per-video toggle blocks yt-dlp for public videos.) |
+| Anti-bot was 403'ing it | With `IMPERSONATE=true` it now succeeds; with `IMPERSONATE=false` you may see the temporary-failure message. |
+| A **private** account video | `هذا المحتوى خاص أو يتطلب تسجيل دخول…` — **not** bypassed. |
+| YouTube "Sign in to confirm you're not a bot" | `المنصّة تطلب تسجيل دخول للتأكد أنك لست روبوتاً…` — **not** bypassed. |
+| Age-restricted / members-only / DRM / geo-blocked | The matching Arabic reason; never bypassed. |
+| A flaky/temporary failure | `تعذّر التنزيل مؤقتاً… أعد المحاولة` (suggests retry / updating yt-dlp). |
+
+Confirm in logs that **no cookies/login/DRM/geo bypass** is ever used — only
+`impersonate` (browser fingerprint) and retries appear. The classifier routing
+is covered by mirrored unit checks during development.
